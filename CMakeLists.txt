@@ -166,6 +166,7 @@ set(
 )
 
 if(CECE_HAS_FORTRAN)
+  set(TIDE_BUILD_TESTS OFF CACHE BOOL "Disable building TIDE's own tests" FORCE)
   add_subdirectory(src/io/tide)
 
   list(
