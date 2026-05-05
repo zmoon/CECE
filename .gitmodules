@@ -1,0 +1,4 @@
+[submodule "TIDE"]
+	path = src/io/tide
+	url = https://github.com/NOAA-EMC/TIDE
+	branch = develop
