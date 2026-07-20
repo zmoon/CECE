@@ -317,6 +317,7 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
         int amio_threads = 1;
         int amio_read_timeout_s = 120;
         int amio_staging_timeout_ms = 30000;
+        int amio_staging_buffer_count = 8;
         if (config["driver"] && config["driver"]["amio_worker_threads"]) {
             amio_threads = config["driver"]["amio_worker_threads"].as<int>();
             if (amio_threads < 1) {
@@ -341,6 +342,15 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
                 amio_staging_timeout_ms = 60000;
             }
         }
+        if (config["driver"] && config["driver"]["amio_staging_buffer_count"]) {
+            amio_staging_buffer_count = config["driver"]["amio_staging_buffer_count"].as<int>();
+            if (amio_staging_buffer_count < 1) {
+                amio_staging_buffer_count = 1;
+            }
+            if (amio_staging_buffer_count > 4096) {
+                amio_staging_buffer_count = 4096;
+            }
+        }
 
         for (const auto& candidate_model : data_models_to_try) {
             active_data_model = candidate_model;
@@ -352,7 +362,7 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
                        << "path: " << input_file_path << "\n"
                        << "data_model: " << candidate_model << "\n"
                        << "staging_pool:\n"
-                       << "  buffer_count: 8\n"
+                       << "  buffer_count: " << amio_staging_buffer_count << "\n"
                        << "  buffer_capacity_bytes: 268435456\n"
                        << "worker_pool:\n"
                        << "  threads: " << amio_threads << "\n"
