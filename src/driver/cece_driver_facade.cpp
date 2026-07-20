@@ -316,6 +316,7 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
 
         int amio_threads = 1;
         int amio_read_timeout_s = 120;
+        int amio_staging_timeout_ms = 30000;
         if (config["driver"] && config["driver"]["amio_worker_threads"]) {
             amio_threads = config["driver"]["amio_worker_threads"].as<int>();
             if (amio_threads < 1) {
@@ -329,6 +330,15 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
             }
             if (amio_read_timeout_s > 3600) {
                 amio_read_timeout_s = 3600;
+            }
+        }
+        if (config["driver"] && config["driver"]["amio_staging_timeout_ms"]) {
+            amio_staging_timeout_ms = config["driver"]["amio_staging_timeout_ms"].as<int>();
+            if (amio_staging_timeout_ms < 1) {
+                amio_staging_timeout_ms = 1;
+            }
+            if (amio_staging_timeout_ms > 60000) {
+                amio_staging_timeout_ms = 60000;
             }
         }
 
@@ -349,7 +359,7 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
                        << "prefetch:\n"
                        << "  depth: 2\n"
                        << "  read_timeout_s: " << amio_read_timeout_s << "\n"
-                       << "staging_timeout_ms: 30000\n";
+                       << "staging_timeout_ms: " << amio_staging_timeout_ms << "\n";
                 m_file.close();
             }
 
