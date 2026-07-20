@@ -43,14 +43,19 @@ bool build_regrid_plan(amio_dataset_handle read_dataset, int nx, int ny, const s
     auto read_coord = [&](const std::vector<std::string>& candidate_names, std::vector<double>& out, int& nx_val, int& ny_val) {
         for (const auto& name : candidate_names) {
             amio_view_handle view = nullptr;
-            if (amio_read(read_dataset, name.c_str(), 0, nullptr, &view) != AMIO_OK) {
+            amio_status_t read_rc = amio_read(read_dataset, name.c_str(), 0, nullptr, &view);
+            if (read_rc != AMIO_OK) {
+                std::cout << "[DRIVER DEBUG] build_regrid_plan: amio_read failed for candidate '" << name << "' rc=" << read_rc << " ("
+                          << amio_strerror(read_rc) << ")" << std::endl;
                 continue;
             }
             const void* data = nullptr;
             size_t size = 0;
-            if (amio_view_data(view, &data, &size) == AMIO_OK) {
+            amio_status_t data_rc = amio_view_data(view, &data, &size);
+            if (data_rc == AMIO_OK) {
                 amio_shape_t shape{};
-                if (amio_view_shape(view, &shape) == AMIO_OK && shape.rank > 0) {
+                amio_status_t shape_rc = amio_view_shape(view, &shape);
+                if (shape_rc == AMIO_OK && shape.rank > 0) {
                     int len = 1;
                     for (int r = 0; r < shape.rank; ++r) {
                         len *= static_cast<int>(shape.extents[r]);
@@ -84,7 +89,13 @@ bool build_regrid_plan(amio_dataset_handle read_dataset, int nx, int ny, const s
                             out[i] = is_float ? static_cast<const float*>(data)[i] : static_cast<const double*>(data)[i];
                         }
                     }
+                } else if (shape_rc != AMIO_OK) {
+                    std::cout << "[DRIVER DEBUG] build_regrid_plan: amio_view_shape failed for candidate '" << name << "' rc=" << shape_rc << " ("
+                              << amio_strerror(shape_rc) << ")" << std::endl;
                 }
+            } else {
+                std::cout << "[DRIVER DEBUG] build_regrid_plan: amio_view_data failed for candidate '" << name << "' rc=" << data_rc << " ("
+                          << amio_strerror(data_rc) << ")" << std::endl;
             }
             amio_release_view(view);
             if (!out.empty()) {
