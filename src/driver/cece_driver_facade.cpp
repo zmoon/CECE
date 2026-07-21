@@ -455,16 +455,33 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
             const int j1 = band_start(mpi_rank + 1);
 
             // 1. Determine total timesteps from the input variable.
-            //    Since AMIO doesn't expose a public function to query total timesteps,
-            //    we use a binary search with amio_read on the input variable to identify
-            //    the actual record limit (since reads beyond the record limit return AMIO_ERR_INVALID_INPUT).
-            //    We cache the result in file_nt_cache_ to avoid binary search overhead on subsequent steps.
+            //    For cadence-driven temporal profiles, use fixed record counts to
+            //    avoid expensive random-step AMIO probing:
+            //      - hourly -> 24
+            //      - weekly -> 7
+            //      - monthly -> 12
+            //    For streams without recognized cadence, fall back to binary search
+            //    on amio_read return codes.
+            //
+            // TODO(amio): expose a direct metadata query in the public AMIO API
+            // for named dimension lengths (especially time), so callers can
+            // avoid record-probing reads entirely.
             int file_nt = 1;
             auto nt_it = file_nt_cache_.find(var_name);
             if (nt_it != file_nt_cache_.end()) {
                 file_nt = nt_it->second;
             } else {
-                if (!input_var_name.empty()) {
+                std::string cadence_lc = cadence;
+                std::transform(cadence_lc.begin(), cadence_lc.end(), cadence_lc.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+                if (cadence_lc == "hourly") {
+                    file_nt = 24;
+                } else if (cadence_lc == "weekly") {
+                    file_nt = 7;
+                } else if (cadence_lc == "monthly") {
+                    file_nt = 12;
+                } else if (!input_var_name.empty()) {
                     int low = 1;
                     int high = 1000000;
                     int found_nt = 1;
