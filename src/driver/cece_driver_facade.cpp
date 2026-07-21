@@ -318,6 +318,8 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
         int amio_read_timeout_s = 120;
         int amio_staging_timeout_ms = 30000;
         int amio_staging_buffer_count = 8;
+        int amio_prefetch_depth = 2;
+        std::uint64_t amio_staging_buffer_capacity_bytes = 268435456ULL;  // 256 MiB per staging buffer
         if (config["driver"] && config["driver"]["amio_worker_threads"]) {
             amio_threads = config["driver"]["amio_worker_threads"].as<int>();
             if (amio_threads < 1) {
@@ -351,6 +353,25 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
                 amio_staging_buffer_count = 4096;
             }
         }
+        if (config["driver"] && config["driver"]["amio_prefetch_depth"]) {
+            amio_prefetch_depth = config["driver"]["amio_prefetch_depth"].as<int>();
+            if (amio_prefetch_depth < 1) {
+                amio_prefetch_depth = 1;
+            }
+            if (amio_prefetch_depth > 1024) {
+                amio_prefetch_depth = 1024;
+            }
+        }
+        if (config["driver"] && config["driver"]["amio_staging_buffer_capacity_bytes"]) {
+            const std::uint64_t requested_capacity = config["driver"]["amio_staging_buffer_capacity_bytes"].as<std::uint64_t>();
+            amio_staging_buffer_capacity_bytes = requested_capacity;
+            if (amio_staging_buffer_capacity_bytes < 1ULL) {
+                amio_staging_buffer_capacity_bytes = 1ULL;
+            }
+            if (amio_staging_buffer_capacity_bytes > 1073741824ULL) {
+                amio_staging_buffer_capacity_bytes = 1073741824ULL;  // 1024 MiB (1 GiB) per staging buffer
+            }
+        }
 
         for (const auto& candidate_model : data_models_to_try) {
             active_data_model = candidate_model;
@@ -363,11 +384,11 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
                        << "data_model: " << candidate_model << "\n"
                        << "staging_pool:\n"
                        << "  buffer_count: " << amio_staging_buffer_count << "\n"
-                       << "  buffer_capacity_bytes: 268435456\n"
+                       << "  buffer_capacity_bytes: " << amio_staging_buffer_capacity_bytes << "\n"
                        << "worker_pool:\n"
                        << "  threads: " << amio_threads << "\n"
                        << "prefetch:\n"
-                       << "  depth: 2\n"
+                       << "  depth: " << amio_prefetch_depth << "\n"
                        << "  read_timeout_s: " << amio_read_timeout_s << "\n"
                        << "staging_timeout_ms: " << amio_staging_timeout_ms << "\n";
                 m_file.close();
