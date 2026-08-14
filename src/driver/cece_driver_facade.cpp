@@ -1071,6 +1071,18 @@ bool CeceDriverOrchestrator::AdvanceTime(const std::string& time_iso8601, void* 
                             std::copy(local_dst.begin(), local_dst.end(), full_dst.begin() + static_cast<size_t>(j0) * nx_);
                         }
 
+                        // Conservation check on the assembled global field.
+                        // Though full_dst is identical on all ranks after the Allgatherv,
+                        // we guard to rank 0 to avoid redundant computation (and logging).
+                        if (rank == 0) {
+                            double src_sum = 0.0;
+                            for (double v : src) src_sum += v;
+                            double dst_sum = 0.0;
+                            for (double v : full_dst) dst_sum += v;
+                            CECE_LOG_DEBUG("[DRIVER] regrid '" + var_name + "' global src_sum=" + std::to_string(src_sum) +
+                                           " dst_sum=" + std::to_string(dst_sum));
+                        }
+
                         // Populate the CECE field view (i, j, 0) from the full field.
                         auto h_view = Kokkos::create_mirror_view(stream_view);
                         for (int j = 0; j < ny_; ++j) {

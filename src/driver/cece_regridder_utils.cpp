@@ -608,14 +608,9 @@ bool apply_regrid_plan(const RegridPlan& plan, size_t time_offset, bool is_float
 
     // Copy back only the rows owned by this rank, skipping the pad_lo halo rows.
     const size_t row_off = static_cast<size_t>(plan.pad_lo) * nx;
-    double src_sum = 0.0;
-    for (size_t k = 0; k < src_field.extent(0); ++k) src_sum += src_field(k);
-    double dst_sum = 0.0;
     for (size_t k = 0; k < static_cast<size_t>(nx) * nband; ++k) {
         local_dst[k] = dst_field(row_off + k);
-        dst_sum += local_dst[k];
     }
-    std::cout << "[DEBUG REGRID] src_sum: " << src_sum << ", dst_sum: " << dst_sum << std::endl;
     return true;
 }
 
