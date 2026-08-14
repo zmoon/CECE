@@ -29,9 +29,11 @@ axis::topology::UnstructuredMesh<Kokkos::HostSpace> build_axis_mesh(int ni, int 
 /// belong to the local rank. The source mesh remains global so overlaps near
 /// band boundaries stay exact.
 struct RegridPlan {
-    axis::solver::InterpolationMatrix<Kokkos::HostSpace> matrix;  ///< CSR weights: global-source -> local-dst-band
+    axis::solver::InterpolationMatrix<Kokkos::HostSpace> matrix;  ///< CSR weights: global-source -> padded-dst-band
     int j0 = 0;                                                   ///< first destination row owned by this rank
     int j1 = 0;                                                   ///< one-past-last destination row owned by this rank
+    int pad_lo = 0;                                               ///< halo rows added below j0 for correct corner synthesis at seams
+    int pad_hi = 0;                                               ///< halo rows added above j1 for correct corner synthesis at seams
     int file_nx = 0;                                              ///< source longitude count (from coords)
     int file_ny = 0;                                              ///< source latitude count (from coords)
     bool built = false;                                           ///< true once weights are generated

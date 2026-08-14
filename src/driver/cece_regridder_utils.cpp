@@ -505,6 +505,16 @@ bool build_regrid_plan(amio_dataset_handle read_dataset, int nx, int ny, const s
         return true;
     }
 
+    // Pad the band with one halo row on each interior side. StructuredGrid corner
+    // synthesis averages adjacent cell centers, so without the neighbor rows the
+    // outermost cells of a band collapse to half-height and conservative weights
+    // develop seams at every MPI boundary. Clamp at the global poles (no neighbor).
+    plan.pad_lo = (j0 > 0) ? 1 : 0;
+    plan.pad_hi = (j1 < ny) ? 1 : 0;
+    const int pj0 = j0 - plan.pad_lo;
+    const int pj1 = j1 + plan.pad_hi;
+    const int pnband = pj1 - pj0;
+
     // A. Build the (global) source mesh and the rank-local destination sub-mesh.
     auto src_mesh = build_axis_mesh(plan.file_nx, plan.file_ny, src_lons, src_lats);
 
@@ -512,13 +522,13 @@ bool build_regrid_plan(amio_dataset_handle read_dataset, int nx, int ny, const s
     std::vector<double> band_lats;
 
     if (target_lons.size() == static_cast<size_t>(nx) * ny && ny > 1) {
-        // Curvilinear coordinate arrays: slice [j0 * nx, j1 * nx] for both axes
-        band_lons.assign(target_lons.begin() + static_cast<size_t>(j0) * nx, target_lons.begin() + static_cast<size_t>(j1) * nx);
-        band_lats.assign(target_lats.begin() + static_cast<size_t>(j0) * nx, target_lats.begin() + static_cast<size_t>(j1) * nx);
+        // Curvilinear coordinate arrays: slice [pj0 * nx, pj1 * nx] for both axes
+        band_lons.assign(target_lons.begin() + static_cast<size_t>(pj0) * nx, target_lons.begin() + static_cast<size_t>(pj1) * nx);
+        band_lats.assign(target_lats.begin() + static_cast<size_t>(pj0) * nx, target_lats.begin() + static_cast<size_t>(pj1) * nx);
     } else {
-        // Rectilinear coordinate arrays: slice [j0, j1] for latitude, keep lons as-is
+        // Rectilinear coordinate arrays: slice [pj0, pj1] for latitude, keep lons as-is
         band_lons = target_lons;
-        band_lats.assign(target_lats.begin() + j0, target_lats.begin() + j1);
+        band_lats.assign(target_lats.begin() + pj0, target_lats.begin() + pj1);
     }
 
     // Align the longitude range of the destination tile with the range of the source file.
@@ -544,7 +554,7 @@ bool build_regrid_plan(amio_dataset_handle read_dataset, int nx, int ny, const s
         }
     }
 
-    auto dst_mesh = build_axis_mesh(nx, nband, band_lons, band_lats, gridspec_file);
+    auto dst_mesh = build_axis_mesh(nx, pnband, band_lons, band_lats, gridspec_file);
 
     // B. Configure weight generation method.
     axis::solver::RegridConfig regrid_cfg;
@@ -573,6 +583,7 @@ bool build_regrid_plan(amio_dataset_handle read_dataset, int nx, int ny, const s
 bool apply_regrid_plan(const RegridPlan& plan, size_t time_offset, bool is_float, const void* view_data, int file_nx, int file_ny, int nx,
                        std::vector<double>& local_dst) {
     const int nband = plan.j1 - plan.j0;
+    const int pnband = nband + plan.pad_lo + plan.pad_hi;
     local_dst.assign(static_cast<size_t>(nx) * std::max(nband, 0), 0.0);
     if (nband <= 0) {
         return true;  // No rows on this rank.
@@ -589,21 +600,22 @@ bool apply_regrid_plan(const RegridPlan& plan, size_t time_offset, bool is_float
         }
     }
 
-    // E. Apply cached weights to produce the rank-local destination band [nx * nband].
-    Kokkos::View<double*, Kokkos::HostSpace> dst_field("dst_field", static_cast<size_t>(nx) * nband);
+    // E. Apply cached weights to produce the padded destination band [nx * pnband].
+    Kokkos::View<double*, Kokkos::HostSpace> dst_field("dst_field", static_cast<size_t>(nx) * pnband);
     axis::field_view<const double, 1> src_view(src_field.data(), static_cast<size_t>(file_nx) * file_ny);
-    axis::field_view<double, 1> dst_view(dst_field.data(), static_cast<size_t>(nx) * nband);
+    axis::field_view<double, 1> dst_view(dst_field.data(), static_cast<size_t>(nx) * pnband);
     axis::solver::apply(plan.matrix, src_view, dst_view);
 
+    // Copy back only the rows owned by this rank, skipping the pad_lo halo rows.
+    const size_t row_off = static_cast<size_t>(plan.pad_lo) * nx;
     double src_sum = 0.0;
     for (size_t k = 0; k < src_field.extent(0); ++k) src_sum += src_field(k);
     double dst_sum = 0.0;
-    for (size_t k = 0; k < dst_field.extent(0); ++k) dst_sum += dst_field(k);
-    std::cout << "[DEBUG REGRID] src_sum: " << src_sum << ", dst_sum: " << dst_sum << std::endl;
-
     for (size_t k = 0; k < static_cast<size_t>(nx) * nband; ++k) {
-        local_dst[k] = dst_field(k);
+        local_dst[k] = dst_field(row_off + k);
+        dst_sum += local_dst[k];
     }
+    std::cout << "[DEBUG REGRID] src_sum: " << src_sum << ", dst_sum: " << dst_sum << std::endl;
     return true;
 }
 
