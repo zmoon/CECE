@@ -793,6 +793,7 @@ class Megan3SchemeTest : public ::testing::Test {
     conf::Value MakeConfig() {
         std::string yaml = "mechanism_file: \"" + (tmp_dir / "spc_test.yaml").string() + "\"\n";
         yaml += "speciation_file: \"" + (tmp_dir / "map_test.yaml").string() + "\"\n";
+        yaml += "history_mode: fixed\n";
         config_.emplace(conf::Config::from_string(yaml));
         return config_->root();
     }
@@ -806,7 +807,7 @@ TEST(MeganHistoryTest, DefaultsAndOverrides) {
     auto defaults = conf::Config::from_string("{}");
     const auto a = MeganHistory::FromConfig(defaults.root());
     EXPECT_DOUBLE_EQ(a.temperature_k, 297.0);
-    EXPECT_DOUBLE_EQ(a.par_wm2, 400.0);
+    EXPECT_DOUBLE_EQ(a.par_wm2, 78.0);
     EXPECT_DOUBLE_EQ(a.days_between_lai, 30.0);
     EXPECT_EQ(a.day_of_year, 180);
     EXPECT_FALSE(a.leaf_age_uses_history);
@@ -833,7 +834,7 @@ TEST(MeganHistoryTest, InvalidOptionsFail) {
 TEST_F(Megan3SchemeTest, EffectiveHistoryOptionsReachRuntime) {
     auto run = [&](const std::string& extra) {
         const std::string text = "mechanism_file: \"" + (tmp_dir / "spc_test.yaml").string() + "\"\nspeciation_file: \"" +
-                                 (tmp_dir / "map_test.yaml").string() + "\"\n" + extra;
+                                 (tmp_dir / "map_test.yaml").string() + "\"\nhistory_mode: fixed\n" + extra;
         auto config = conf::Config::from_string(text);
         Megan3Scheme scheme;
         scheme.Initialize(config.root(), nullptr);
@@ -845,14 +846,53 @@ TEST_F(Megan3SchemeTest, EffectiveHistoryOptionsReachRuntime) {
     };
     const double original = run("");
     ASSERT_GT(original, 0.0);
-    EXPECT_DOUBLE_EQ(original, run("temperature_history_k: 297\npar_history_wm2: 400\ndays_between_lai: 30\nday_of_year: 180\n"));
+    EXPECT_DOUBLE_EQ(original, run("temperature_history_k: 297\npar_history_wm2: 78\ndays_between_lai: 30\nday_of_year: 180\n"));
     EXPECT_NE(original, run("temperature_history_k: 288.15\n"));
-    EXPECT_NE(original, run("par_history_wm2: 78\n"));
+    EXPECT_NE(original, run("par_history_wm2: 90\n"));
     EXPECT_NE(original, run("day_of_year: 1\n"));
     import_state.fields["leaf_area_index_prev"] = create_dv("previous_lai", 2.0);
     EXPECT_NE(run("days_between_lai: 1\n"), run("days_between_lai: 30\n"));
     EXPECT_NE(run("temperature_history_k: 280\nleaf_age_uses_temperature_history: true\n"),
               run("temperature_history_k: 280\nleaf_age_uses_temperature_history: false\n"));
+}
+
+TEST_F(Megan3SchemeTest, EvolvingHistoryIsDefaultAndUsesColdStartWithoutPreviousLai) {
+    std::string yaml = "mechanism_file: \"" + (tmp_dir / "spc_test.yaml").string() + "\"\n";
+    yaml += "speciation_file: \"" + (tmp_dir / "map_test.yaml").string() + "\"\n";
+    auto config = conf::Config::from_string(yaml);
+
+    Megan3Scheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    EXPECT_THROW(scheme.Run(import_state, export_state), std::runtime_error) << "evolving history needs the scheduler clock";
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.elapsed_seconds = 3600;
+    context.day_of_year = 171;
+
+    SetFieldValue("MEGAN_ISOP", 0.0, false);
+    EXPECT_NO_THROW(scheme.Run(import_state, export_state, context));
+    auto& output = export_state.fields.at("MEGAN_ISOP");
+    output.sync<Kokkos::HostSpace>();
+    const double first = output.view_host()(0, 0, 0);
+    ASSERT_GT(first, 0.0);
+
+    SetFieldValue("MEGAN_ISOP", 0.0, false);
+    context.elapsed_seconds = 7200;
+    EXPECT_NO_THROW(scheme.Run(import_state, export_state, context));
+    output.sync<Kokkos::HostSpace>();
+    const double second = output.view_host()(0, 0, 0);
+    EXPECT_GT(second, 0.0);
+    EXPECT_NE(first, second);
+}
+
+TEST_F(Megan3SchemeTest, RejectsUnknownHistoryMode) {
+    std::string yaml = "mechanism_file: \"" + (tmp_dir / "spc_test.yaml").string() + "\"\n";
+    yaml += "speciation_file: \"" + (tmp_dir / "map_test.yaml").string() + "\"\n";
+    yaml += "history_mode: unsupported\n";
+    auto config = conf::Config::from_string(yaml);
+
+    Megan3Scheme scheme;
+    EXPECT_THROW(scheme.Initialize(config.root(), nullptr), std::invalid_argument);
 }
 
 // Test: Factory creates Megan3Scheme for "megan3" (Req 9.5)
@@ -1063,10 +1103,11 @@ TEST_F(Megan3SchemeTest, OutputMappingRenamesMeganFields) {
 
     scheme->Initialize(cfg.options, nullptr);
 
-    // Run the scheme
-    scheme->Run(import_state, export_state);
-
-    // The speciation engine writes to "MEGAN_ISOP" directly in the export state
+    // Run the scheme with the scheduler context that the default evolving history requires
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.day_of_year = 171;
+    scheme->Run(import_state, export_state, context);
     auto& dv_orig = export_state.fields["MEGAN_ISOP"];
     dv_orig.sync<Kokkos::HostSpace>();
     double orig_val = dv_orig.view_host()(0, 0, 0);

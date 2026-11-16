@@ -47,7 +47,13 @@ class CountingPhysicsScheme final : public PhysicsScheme {
         ++run_count;
     }
 
+    void Run(CeceImportState&, CeceExportState&, const SchemeRunContext& context) override {
+        contexts.push_back(context);
+        ++run_count;
+    }
+
     int run_count = 0;
+    std::vector<SchemeRunContext> contexts;
 };
 
 void ConfigureSingleScheme(CeceInternalData& data, const std::string& name, std::unique_ptr<PhysicsScheme> scheme) {
@@ -121,6 +127,14 @@ TEST(StageOrderTest, InvalidComponentTypeFailsClosedWithComponentName) {
     } catch (const std::invalid_argument& error) {
         EXPECT_STREQ(error.what(), "Component \"invalid_component\" has an invalid ComponentType value.");
     }
+}
+
+TEST(ClockRunContextTest, ExposesUtcEpochAndDayOfYear) {
+    CeceClock clock("2020-12-31T23:55:00", "2021-01-01T00:10:00", 300, {});
+    const StepResult step = clock.Advance();
+
+    EXPECT_EQ(step.utc_epoch_seconds, 1609459200);
+    EXPECT_EQ(step.day_of_year, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +492,33 @@ TEST(CoreRunCapiTest, FinalStepExecutesSchemeOnceAndReturnsCompletion) {
 
     EXPECT_EQ(rc, 1);
     EXPECT_EQ(scheme_ptr->run_count, 1);
+}
+
+TEST(CoreRunCapiTest, SchemeContextUsesConfiguredRefreshIntervalAndClockCalendar) {
+    CeceInternalData data;
+    auto scheme = std::make_unique<CountingPhysicsScheme>();
+    CountingPhysicsScheme* scheme_ptr = scheme.get();
+    ConfigureSingleScheme(data, "counting", std::move(scheme));
+
+    const std::vector<ClockComponent> components = {
+        {ComponentType::kPhysicsScheme, "counting", 900},
+    };
+    data.clock = std::make_unique<CeceClock>("2020-12-31T23:55:00", "2021-01-01T00:15:00", 300, components);
+
+    int rc = 0;
+    cece_core_run(&data, 0, 0, &rc);
+    cece_core_run(&data, 0, 0, &rc);
+    cece_core_run(&data, 0, 0, &rc);
+
+    // Due on the guaranteed first step (elapsed 300 s) and again at 900 s.
+    ASSERT_EQ(scheme_ptr->contexts.size(), 2u);
+    EXPECT_EQ(scheme_ptr->contexts[0].dt_seconds, 900) << "first run represents one scheme interval, not the base step";
+    EXPECT_EQ(scheme_ptr->contexts[1].dt_seconds, 900);
+    EXPECT_EQ(scheme_ptr->contexts[0].elapsed_seconds, 300);
+    EXPECT_EQ(scheme_ptr->contexts[1].elapsed_seconds, 900);
+    EXPECT_EQ(scheme_ptr->contexts[0].day_of_year, 1);
+    EXPECT_EQ(scheme_ptr->contexts[1].day_of_year, 1);
+    EXPECT_EQ(scheme_ptr->contexts[1].utc_epoch_seconds - scheme_ptr->contexts[0].utc_epoch_seconds, 600);
 }
 
 // ---------------------------------------------------------------------------

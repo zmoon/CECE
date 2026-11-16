@@ -7,6 +7,7 @@
  */
 
 #include <conf/value.hpp>
+#include <cstdint>
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
@@ -19,6 +20,19 @@
 #include "cece/cece_state.hpp"
 
 namespace cece {
+
+class LocalTimeService;
+
+/**
+ * @brief Clock information for one scheduled physics-scheme invocation.
+ */
+struct SchemeRunContext {
+    int dt_seconds = 0;                  ///< Seconds since this scheme's previous invocation.
+    int elapsed_seconds = 0;             ///< Seconds since the configured simulation start.
+    int day_of_year = 0;                 ///< UTC day of year, 1-366.
+    std::int64_t utc_epoch_seconds = 0;  ///< Current UTC instant in Unix seconds.
+    const LocalTimeService* local_time = nullptr;
+};
 
 /**
  * @brief Abstract base class for all physics schemes in CECE.
@@ -47,6 +61,15 @@ class PhysicsScheme {
      * @param export_state The output emissions to be updated.
      */
     virtual void Run(CeceImportState& import_state, CeceExportState& export_state) = 0;
+
+    /**
+     * @brief Executes the scheme with the current scheduler time context.
+     * @details Existing schemes may keep implementing the context-free overload.
+     */
+    virtual void Run(CeceImportState& import_state, CeceExportState& export_state, const SchemeRunContext& context) {
+        (void)context;
+        Run(import_state, export_state);
+    }
 };
 
 /**

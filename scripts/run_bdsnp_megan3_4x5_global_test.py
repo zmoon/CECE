@@ -148,7 +148,7 @@ CECE_MEGAN = MeganParameters(
     gp3=2.46,
     gp4=0.9,
     history_temperature=297.0,
-    history_par=400.0,
+    history_par=78.0,
     day_of_year=180,
     days_between=30.0,
     co2_ppm=390.0,
@@ -288,14 +288,15 @@ def get_gamma_co2(co2a: ArrayLike, params: MeganParameters) -> FloatArray:
 # MEGAN3 ISOP class constants -- src/core/physics/cece_emission_activity.cpp
 # (class index 0 == ISOP) and src/core/physics/cece_megan3.cpp
 # ============================================================================
-# Hard-coded "no dynamic history" defaults actually used by Megan3Scheme::Run
-# today (cece_megan3.cpp, inside the Kokkos kernel) -- these are NOT the HEMCO
-# cold-start values; CECE does not yet feed a running 5-day/12-hour history in.
+# Scalar-history defaults of Megan3Scheme with ``history_mode: fixed`` (the
+# reference modelled below). The scheme's default ``history_mode: evolving``
+# instead cold-starts at the HEMCO values and builds running means over the run,
+# which a single synthetic snapshot cannot represent.
 def megan3_isop_activity_factor_cece(
     fields: Mapping[str, ArrayLike], params: MeganParameters = CECE_MEGAN
 ) -> FloatArray:
-    """Reproduces the per-cell ISOP term inside Megan3Scheme::Run exactly,
-    using the scheme's real (hard-coded) history defaults."""
+    """Reproduces the per-cell ISOP term inside Megan3Scheme::Run exactly
+    for history_mode: fixed, using the scheme's scalar history defaults."""
     temperature = fields["temperature"]
     lai = fields["leaf_area_index"]
     g_lai_c = get_gamma_lai(lai, params)
@@ -627,7 +628,7 @@ def make_plots(
     )
     ax.set(
         title="CECE native MEGAN3 vs HEMCO 3.12.1 source oracle: % diff in ISOP activity factor\n"
-        "(diagnostic comparison; CECE lacks HEMCO's running PAR/T history -- see summary.txt)",
+        "(diagnostic comparison; CECE fixed-history mode vs HEMCO cold-start values -- see summary.txt)",
         xlabel="Longitude [deg]",
         ylabel="Latitude [deg]",
     )
@@ -640,7 +641,7 @@ def make_plots(
     ax.plot(
         np.nanmean(isop_activity_cece, axis=1),
         LAT,
-        label="CECE native MEGAN3 (current hard-coded history)",
+        label="CECE native MEGAN3 (history_mode: fixed defaults)",
     )
     ax.plot(
         np.nanmean(isop_activity_hemco, axis=1),
@@ -771,10 +772,12 @@ def main() -> None:
             "HEMCO oracle uses 1.0."
         ),
         (
-            "    2. History/cold-start convention: CECE's Megan3Scheme::Run kernel currently hard-codes "
-            "T_AVG_15=297.0 K, PAR_AVG=400.0 W m-2, DOY=180, LAI dbtwn=30 days "
-            "(no running 5-day/12-hour history is wired in yet); the HEMCO oracle uses the HEMCO "
-            "no-restart cold-start values (T_DAVG=288.15 K, PARDR/PARDF_DAVG=30/48 W m-2, DOY=171, dbtwn=1 day)."
+            "    2. History/cold-start convention: this reference models Megan3Scheme with "
+            "history_mode: fixed, whose scalar defaults are T_AVG_15=297.0 K, PAR_AVG=78.0 W m-2, "
+            "DOY=180, LAI dbtwn=30 days (the default evolving mode builds running 5-day/12-hour "
+            "histories from a cold start over a run, which a single snapshot cannot represent); the "
+            "HEMCO oracle uses the HEMCO no-restart cold-start values "
+            "(T_DAVG=288.15 K, PARDR/PARDF_DAVG=30/48 W m-2, DOY=171, dbtwn=1 day)."
         ),
         (
             f"    3. NORM_FAC: CECE uses the literal constant 1/1.0101081 = {CECE_MEGAN.norm_factor:.10f}; "

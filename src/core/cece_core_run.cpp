@@ -48,11 +48,19 @@ void IngestEmissions(cece::CeceInternalData& d) {
     d.ingestor.IngestEmissionsInline(d.config.cece_data, d.import_state, d.nx, d.ny_local, d.nz);
 }
 
-void RunPhysicsSchemeByName(cece::CeceInternalData& d, const std::string& scheme_name) {
+void RunPhysicsSchemeByName(cece::CeceInternalData& d, const std::string& scheme_name, const cece::StepResult& step, int interval_seconds) {
     for (size_t i = 0; i < d.active_schemes.size(); ++i) {
         if (i < d.config.physics_schemes.size() && d.config.physics_schemes[i].name == scheme_name) {
             if (d.active_schemes[i]) {
-                d.active_schemes[i]->Run(d.import_state, d.export_state);
+                cece::SchemeRunContext context;
+                context.elapsed_seconds = step.elapsed_seconds;
+                context.utc_epoch_seconds = step.utc_epoch_seconds;
+                context.day_of_year = step.day_of_year;
+                context.local_time = d.local_time.get();
+                // The scheme's own cadence is the time it represents (HEMCO's TS_EMIS), including on the
+                // first-step guaranteed run.
+                context.dt_seconds = interval_seconds;
+                d.active_schemes[i]->Run(d.import_state, d.export_state, context);
             }
             break;
         }
@@ -80,7 +88,7 @@ void ExecuteClockComponent(cece::CeceInternalData& d, const cece::ClockComponent
             break;
         }
         case cece::ComponentType::kPhysicsScheme: {
-            RunPhysicsSchemeByName(d, comp->name);
+            RunPhysicsSchemeByName(d, comp->name, step, comp->refresh_interval_secs);
             break;
         }
         case cece::ComponentType::kStackingEngine: {
@@ -118,9 +126,12 @@ void ExecuteStepUnconditional(cece::CeceInternalData& d, int hour, int day_of_we
 
     IngestEmissions(d);
 
+    cece::SchemeRunContext context;
+    context.dt_seconds = d.config.driver_config.timestep_seconds;
+    context.local_time = d.local_time.get();
     for (auto& scheme : d.active_schemes) {
         if (scheme) {
-            scheme->Run(d.import_state, d.export_state);
+            scheme->Run(d.import_state, d.export_state, context);
         }
     }
 

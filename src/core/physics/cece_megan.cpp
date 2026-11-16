@@ -60,10 +60,15 @@ void MeganScheme::Initialize(const conf::Value& config, CeceDiagnosticManager* d
 
     // ---- HEMCO 3.12.1 source-conformance-mode settings ----
     if (megan_method_ == "hemco_3_12_1") {
+        const std::string history_mode = config["history_mode"].string_or("evolving");
+        if (history_mode != "evolving" && history_mode != "fixed") {
+            throw std::invalid_argument("MeganScheme: history_mode must be 'evolving' or 'fixed'");
+        }
+        hemco_history_evolving_ = history_mode == "evolving";
         if (!config["aef"].is_defined() && !config["aef_isop"].is_defined()) {
             throw std::invalid_argument("MeganScheme: hemco_3_12_1 mode requires an explicit effective 'aef'");
         }
-        if (!config["hemco_day_of_year"].is_defined()) {
+        if (!hemco_history_evolving_ && !config["hemco_day_of_year"].is_defined()) {
             throw std::invalid_argument("MeganScheme: hemco_3_12_1 mode requires explicit 'hemco_day_of_year'");
         }
         if (!config["hemco_co2_inhibition"].is_defined()) {
@@ -82,15 +87,14 @@ void MeganScheme::Initialize(const conf::Value& config, CeceDiagnosticManager* d
             const auto value = config[key];
             return value.is_defined() ? value.as_double() : fallback;
         };
-        // HEMCO stores all three history arrays as REAL(sp). Project YAML
-        // values through float once before promoting them for scalar arithmetic.
-        hemco_par_direct_history_wm2_ =
-            static_cast<double>(static_cast<float>(optional_double("hemco_par_direct_history_wm2", hemco_megan::v3_12_1::kParDirectHistoryWm2)));
-        hemco_par_diffuse_history_wm2_ =
-            static_cast<double>(static_cast<float>(optional_double("hemco_par_diffuse_history_wm2", hemco_megan::v3_12_1::kParDiffuseHistoryWm2)));
-        hemco_temperature_history_k_ =
-            static_cast<double>(static_cast<float>(optional_double("hemco_temperature_history_k", hemco_megan::v3_12_1::kTemperatureHistoryK)));
-        hemco_day_of_year_ = config["hemco_day_of_year"].as_int();
+        hemco_par_direct_history_wm2_ = optional_double("hemco_par_direct_history_wm2", hemco_megan::v3_12_1::kParDirectHistoryWm2);
+        hemco_par_diffuse_history_wm2_ = optional_double("hemco_par_diffuse_history_wm2", hemco_megan::v3_12_1::kParDiffuseHistoryWm2);
+        hemco_temperature_history_k_ = optional_double("hemco_temperature_history_k", hemco_megan::v3_12_1::kTemperatureHistoryK);
+        hemco_day_of_year_ = config["hemco_day_of_year"].is_defined() ? config["hemco_day_of_year"].as_int() : hemco_megan::v3_12_1::kReferenceDoy;
+        if (hemco_history_evolving_ && config["hemco_day_of_year"].is_defined()) {
+            CECE_LOG_WARNING("MeganScheme: hemco_day_of_year is ignored with history_mode: evolving; the CECE clock supplies the day of year");
+        }
+        hemco_history_state_ = MeganHistoryState{};
 
         if (hemco_co2_inhibition_ && (!std::isfinite(hemco_co2_ppm_) || hemco_co2_ppm_ < 150.0 || hemco_co2_ppm_ > 1250.0)) {
             throw std::invalid_argument("MeganScheme: hemco_co2_ppm must be in [150, 1250] when CO2 inhibition is enabled");
@@ -165,6 +169,10 @@ void MeganScheme::Initialize(const conf::Value& config, CeceDiagnosticManager* d
 }
 
 void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_state) {
+    Run(import_state, export_state, SchemeRunContext{});
+}
+
+void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_state, const SchemeRunContext& context) {
     auto temp = ResolveImport("temperature", import_state);
     auto emissions_out = ResolveExport(export_field_name_, export_state);
     auto lai = ResolveImport("leaf_area_index", import_state);
@@ -176,9 +184,10 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
     auto gwetroot = ResolveImport("soil_moisture_root", import_state);
 
     if (megan_method_ == "hemco_3_12_1") {
+        const bool require_previous_lai = !hemco_history_evolving_;
         RequireFields("MeganScheme hemco_3_12_1 mode", {{MapInput("temperature"), temp.data() != nullptr},
                                                         {MapInput("leaf_area_index"), lai.data() != nullptr},
-                                                        {MapInput("leaf_area_index_prev"), pmlai.data() != nullptr},
+                                                        {MapInput("leaf_area_index_prev"), !require_previous_lai || pmlai.data() != nullptr},
                                                         {MapInput("par_direct"), pardr.data() != nullptr},
                                                         {MapInput("par_diffuse"), pardf.data() != nullptr},
                                                         {MapInput("solar_cosine"), suncos.data() != nullptr},
@@ -196,7 +205,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
     int ny = static_cast<int>(emissions_out.extent(1));
 
     // ============================================================
-    // HEMCO 3.12.1 stateless source-conformance path
+    // HEMCO 3.12.1 source-conformance path
     // ============================================================
     if (megan_method_ == "hemco_3_12_1") {
         auto require_scalar_shape = [nx, ny](const auto& view, const std::string& name) {
@@ -210,7 +219,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
         require_scalar_shape(pardr, MapInput("par_direct"));
         require_scalar_shape(pardf, MapInput("par_diffuse"));
         require_scalar_shape(suncos, MapInput("solar_cosine"));
-        require_scalar_shape(pmlai, MapInput("leaf_area_index_prev"));
+        if (!hemco_history_evolving_) require_scalar_shape(pmlai, MapInput("leaf_area_index_prev"));
 
         using CellPolicy = Kokkos::MDRangePolicy<Kokkos::DefaultExecutionSpace, Kokkos::Rank<2>>;
         const CellPolicy cells({0, 0}, {nx, ny});
@@ -229,11 +238,21 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
         const double h_aef = aef_;
         const double h_co2 = hemco_co2_ppm_;
         const bool h_apply_co2 = hemco_co2_inhibition_;
+        if (hemco_history_evolving_) {
+            MeganHistoryState::RequireClock("MeganScheme hemco_3_12_1", context.dt_seconds, context.day_of_year);
+            hemco_history_state_.InitializeIfNeeded(nx, ny, lai, hemco_temperature_history_k_, hemco_megan::v3_12_1::kTemperatureHistoryK,
+                                                    hemco_par_direct_history_wm2_, hemco_par_diffuse_history_wm2_);
+        }
+        const auto h_temperature_history_view = hemco_history_state_.temperature_5day;
+        const auto h_pardr_history_view = hemco_history_state_.par_direct_5day;
+        const auto h_pardf_history_view = hemco_history_state_.par_diffuse_5day;
+        const auto h_lai_previous_view = hemco_history_state_.lai_12hour;
         const double h_pardr_history = hemco_par_direct_history_wm2_;
         const double h_pardf_history = hemco_par_diffuse_history_wm2_;
         const double h_temperature_history = hemco_temperature_history_k_;
         const double h_days_between_lai = hemco_megan::v3_12_1::kDaysBetweenLai;
-        const int h_doy = hemco_day_of_year_;
+        const int h_doy = hemco_history_evolving_ ? context.day_of_year : hemco_day_of_year_;
+        const bool h_evolving = hemco_history_evolving_;
 
         Kokkos::parallel_for(
             "MeganKernel_HEMCO3121", cells, KOKKOS_LAMBDA(int i, int j) {
@@ -245,7 +264,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
                     return;
                 }
 
-                const double Lprev = pmlai(i, j, 0);
+                const double Lprev = h_evolving ? h_lai_previous_view(i, j, 0) : pmlai(i, j, 0);
                 const double sc = suncos(i, j, 0);
                 const double qd = pardr(i, j, 0);
                 const double qi = pardf(i, j, 0);
@@ -259,15 +278,18 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
                 in.suncos = sc;
                 in.co2_ppm = h_co2;
                 in.apply_co2_inhibition = h_apply_co2;
-                in.pardr_history_Wm2 = h_pardr_history;
-                in.pardf_history_Wm2 = h_pardf_history;
-                in.temperature_history_K = h_temperature_history;
+                in.pardr_history_Wm2 = h_evolving ? h_pardr_history_view(i, j, 0) : h_pardr_history;
+                in.pardf_history_Wm2 = h_evolving ? h_pardf_history_view(i, j, 0) : h_pardf_history;
+                in.temperature_history_K = h_evolving ? h_temperature_history_view(i, j, 0) : h_temperature_history;
                 in.days_between_lai = h_days_between_lai;
                 in.doy = h_doy;
 
                 emissions_out(i, j, 0) = h_aef * IsopreneEmissionFactor(in);
             });
         Kokkos::fence();
+        if (hemco_history_evolving_) {
+            hemco_history_state_.Update(temp, pardr, pardf, lai, context.dt_seconds);
+        }
         MarkModified(export_field_name_, export_state);
         return;
     }

@@ -8,8 +8,9 @@ CECE provides two C++ MEGAN biogenic emission schemes:
   two emission methods:
   - `"megan21"` (default) — configurable MEGAN2.1 isoprene calculation. The
     existing `"native"` spelling remains an equivalent compatibility alias.
-  - `"hemco_3_12_1"` — source-pinned HEMCO 3.12.1 stateless isoprene calculation
-    using supplied effective inputs and fixed source parameters.
+  - `"hemco_3_12_1"` — source-pinned HEMCO 3.12.1 isoprene calculation with
+    cold-started, evolving per-cell temperature, PAR, and LAI histories by
+    default. Set `history_mode: fixed` to use the configured scalar histories.
 - **`megan3`** — CECE's 19-class biogenic emission and chemical-speciation scheme. Its C++ runtime uses bulk activity factors; the available multilayer canopy helpers are not yet wired into that emission calculation. This is not a claim of complete or independently validated upstream MEGAN3 science.
 
 Both schemes execute CECE code; `hemco_3_12_1` does not launch HEMCO, and
@@ -36,7 +37,7 @@ The original scheme computes isoprene emissions using activity factors for LAI, 
 |---|---|
 | `"megan21"` (default) | Configurable MEGAN2.1 isoprene |
 | `"native"` | Compatibility alias for `"megan21"`; unchanged calculation |
-| `"hemco_3_12_1"` | Source-pinned HEMCO 3.12.1 stateless isoprene arithmetic with explicit cold-start histories and CO₂ switch |
+| `"hemco_3_12_1"` | Source-pinned HEMCO 3.12.1 isoprene calculation; evolving histories by default, optional fixed scalar histories |
 
 ### Configuration (MEGAN2.1 mode)
 
@@ -67,7 +68,7 @@ physics_schemes:
       hemco_par_direct_history_wm2: 30.0
       hemco_par_diffuse_history_wm2: 48.0
       hemco_temperature_history_k: 288.15
-      hemco_day_of_year: 171
+      history_mode: evolving   # default; the CECE clock supplies dt and day of year
 ```
 
 | Parameter | Type | Default | Description |
@@ -77,10 +78,11 @@ physics_schemes:
 | `species_name` | string | `"isoprene"` | This source-conformance path accepts only `"isoprene"` or HEMCO name `"ISOP"` |
 | `hemco_co2_inhibition` | bool | required | Explicitly enable or disable the HEMCO CO₂ inhibition option |
 | `hemco_co2_ppm` | double | required if enabled | CO₂ concentration [ppm] in the finite range 150-1250 (`hemco_3_12_1` only) |
-| `hemco_par_direct_history_wm2` | double | `30.0` | No-restart direct PAR history [W m⁻²] |
-| `hemco_par_diffuse_history_wm2` | double | `48.0` | No-restart diffuse PAR history [W m⁻²] |
-| `hemco_temperature_history_k` | double | `REAL(sp)(288.15)` | No-restart `T_DAVG` [K] |
-| `hemco_day_of_year` | integer | required | Controlled-case day of year (1-366) |
+| `history_mode` | string | `"evolving"` | `"evolving"` initializes HEMCO-like per-cell histories and updates after emissions; `"fixed"` uses configured values |
+| `hemco_par_direct_history_wm2` | double | `30.0` | Initial direct PAR history [W m⁻²] in evolving mode, fixed direct history otherwise |
+| `hemco_par_diffuse_history_wm2` | double | `48.0` | Initial diffuse PAR history [W m⁻²] in evolving mode, fixed diffuse history otherwise |
+| `hemco_temperature_history_k` | double | `288.15` | Initial/fixed historical temperature [K] |
+| `hemco_day_of_year` | integer | required in fixed mode | Fixed-history day of year. Ignored (with a warning) in evolving mode, where the CECE clock supplies it |
 
 `co2_concentration` remains a compatibility alias for `hemco_co2_ppm`, and
 `aef_isop` is accepted when `aef` is absent. Source mode requires a finite,
@@ -94,20 +96,38 @@ histories and `hemco_temperature_history_k` instead.
 | --- | --- | --- |
 | `temperature` | K | Surface air temperature |
 | `leaf_area_index` | m²/m² | Effective current LAI |
-| `leaf_area_index_prev` | m²/m² | Required exact effective previous-day `PMISOLAI` in `hemco_3_12_1` mode, after HEMCO storage and optional PFT normalization; CECE does not round it again |
+| `leaf_area_index_prev` | m²/m² | Required exact effective previous-day `PMISOLAI` only in fixed-history mode; evolving mode initializes it from current LAI |
 | `par_direct` | W/m² | Direct PAR |
 | `par_diffuse` | W/m² | Diffuse PAR |
 | `solar_cosine` | — | Finite effective sine of solar elevation (cosine of zenith) in [-1, 1]; nonpositive values represent night |
 | `soil_moisture_root` | fraction | Root-zone soil moisture (optional) |
 
-All required source-conformance fields, including previous-day LAI, and the
-output must have the same horizontal extents and one level;
-the scheme fails before launching its kernel if those shapes differ.
+All required source-conformance fields and the output must have the same
+horizontal extents and one level. `leaf_area_index_prev` is required only in
+`history_mode: fixed`; evolving mode initializes previous-day LAI from current
+LAI and advances it as a 12-hour running average.
+The scheme fails before launching its kernel if those shapes differ.
 
 For `hemco_3_12_1`, the scalar AEF must already include any upstream PFT/AEF
 processing and isoprene scaling. Supply both LAI fields after any desired PFT
-normalization. AEF and the three configured histories are spatially uniform;
-this mode does not generate gridded emission factors or evolve history state.
+normalization. AEF and the configured cold-start/fixed histories are spatially
+uniform. The default evolving mode stores per-cell state in double precision and updates
+the 5-day temperature/direct-PAR/diffuse-PAR means and 12-hour temperature/LAI
+means after each emission calculation. The 12-hour temperature mean mirrors
+HEMCO's `T_PREVDAY`, which HEMCO 3.12.1 passes to its light-dependent
+temperature function but documents as unused; no emission term reads it here
+either. A cold start uses 288.15 K, 30 W/m² direct PAR, 48 W/m² diffuse PAR, and
+current LAI; restart I/O is not yet implemented. PAR remains configured in W/m²
+and is converted internally to µmol/m²/s using the HEMCO factor 4.766.
+
+Evolving mode requires the scheduler clock: the running-mean weight is
+`dt / tau`, where `dt` is the scheme's refresh interval (`refresh_interval_seconds`,
+or the base `timestep_seconds`), matching HEMCO's emission time step, and the day
+of year comes from the clock. Calling the scheme without that context fails with
+an error; use `history_mode: fixed` for context-free calls. If `dt` exceeds the
+tau of a running mean (for example a scheme interval above 12 hours for the LAI
+history) the weight is clamped to 1, so that history equals the current sample,
+and a warning is logged once.
 
 ### Effective-history settings for the configurable C++ schemes
 
@@ -117,15 +137,22 @@ The following scalar options apply to `megan_method: megan21` (including its
 | Option | Default | Meaning |
 |---|---|---|
 | `temperature_history_k` | 297 | Finite positive effective historical temperature, K |
-| `par_history_wm2` | 400 | Finite nonnegative effective total historical PAR, W/m² |
+| `par_history_wm2` | 78 | Finite nonnegative effective total historical PAR, W/m² |
 | `days_between_lai` | 30 | Finite positive interval for leaf-age calculation, days |
 | `day_of_year` | 180 | Integer in 1-366 |
 | `leaf_age_uses_temperature_history` | false | Use history temperature for leaf age instead of current temperature |
 
-Defaults preserve the existing calculations. These settings are supplied, not
-time-evolving histories, and are not automatically inferred from the driver
-clock. The HEMCO method uses its separate `hemco_*` settings. Changing the
-method name from `native` to `megan21` does not alter defaults or calculations.
+For `megan21`, these settings remain supplied scalar histories. For `megan3`
+they are the `history_mode: fixed` settings. In the default evolving mode,
+`temperature_history_k` and `par_history_wm2` only seed the cold start (the PAR
+value seeds the diffuse history, direct starts at zero; without them the HEMCO
+values 288.15 K, 30 and 48 W/m² are used), while `day_of_year`,
+`days_between_lai`, and `leaf_age_uses_temperature_history` are ignored with a
+warning: the clock supplies the day, leaf age uses a one-day interval and the
+history temperature. `megan3` evolving mode requires the scheduler clock like
+the HEMCO method above.
+Changing the method name from `native` to `megan21` does not alter defaults or
+calculations.
 
 ### Export Fields
 
@@ -222,7 +249,7 @@ See [Speciation Configuration](#speciation-configuration) below for the YAML for
 The NO emission class reads `soil_nox_emissions` from the export state
 (produced by BDSNP or another soil NO scheme). If the field is missing, a
 warning is logged and NO is set to zero. Canonical `soil_no_method: bdsnp`
-requires the complete stateless effective-input contract documented in
+requires the complete effective-input contract documented in
 [BDSNP Soil NO Emissions](soil_nox.md), including both 24-layer fields. The
 compact example below selects `yl95` so it does not imply those effective
 inputs are generated by MEGAN3.
@@ -497,12 +524,19 @@ the emission calculation rather than merely matching NetCDF variable names:
    including PFT normalization and isoprene scaling where enabled. For a
    no-restart case with LAI normalization disabled, initial previous-day LAI
    equals current LAI; an arbitrary input `LAI_PREV` is not interchangeable.
-3. Match the actual history state used for emissions. CECE projects the three
-   configured HEMCO histories through single precision, but must not round
-   effective previous LAI again after upstream preprocessing. Cold-start values
-   are `REAL(sp)(288.15 K)`, direct PAR `30 W/m²`, and diffuse PAR `48 W/m²`.
-   A restart written after emissions is not automatically the state used for
-   the preceding calculation. Choose the correct date/DOY and CO₂ settings;
+3. Match the actual history state used for emissions. CECE stores evolving
+   histories in double precision; HEMCO stores them in `REAL(sp)`. For smooth
+   quantities the difference is negligible (a test run of the 5-day temperature
+   mean over 60 hourly steps differed by about 2e-4 K), but MEGAN's leaf-age
+   function branches on exact equality of current and previous LAI. With a
+   constant LAI that is not exactly representable in single precision, a double
+   history stays exactly equal (leaf-age factor 0.95) while a single-precision
+   history never does (factor of about 1.0), a roughly 5% emission difference in
+   such cells. Check for this when comparing against an executed HEMCO run.
+   At cold start, previous LAI is current LAI. Temperature history is 288.15 K,
+   direct PAR is 30 W/m², and diffuse PAR is 48 W/m². A restart written after
+   emissions is not automatically the state used for the preceding calculation.
+   Choose the correct date/DOY and CO₂ settings;
    for example, 20 June 2021 is DOY 171, and 390 ppm is a case choice.
 4. Match both solar calculations: HEMCO's `ExtState%SUNCOS` gates day/night,
    while MEGAN `SOLAR_ANGLE` supplies the PAR-response sine using local time
@@ -519,11 +553,11 @@ the emission calculation rather than merely matching NetCDF variable names:
    bitwise identical to single-precision diagnostics.
 
 Source-conformance tests do not launch HEMCO. An independently executed,
-controlled stateless reference comparison is a separate validation level;
-neither establishes real-meteorology, evolving-history/restart, or complete
-upstream MEGAN3 parity. Future work includes gridded PFT/AEF generation,
-time-evolving histories, clock-driven solar calculations, multilayer canopy
-integration, and multi-timestep/coupled validation. Validation reports, plots,
+controlled reference comparison is a separate validation level; neither
+establishes real-meteorology, restart parity, or complete upstream MEGAN3
+parity. Future work includes gridded PFT/AEF generation, clock-driven solar
+calculations, multilayer canopy integration, and multi-timestep/coupled
+validation. Validation reports, plots,
 and run-specific inputs/outputs belong with the external experiment evidence.
 
 ### Regression tests

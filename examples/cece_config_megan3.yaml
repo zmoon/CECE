@@ -36,7 +36,10 @@ physics_schemes:
       enable_wind_stress: false
       enable_temp_stress: false
       enable_aq_stress: false
-      day_of_year: 171 # Scalar effective setting; not inferred from driver time
+      # history_mode defaults to "evolving": temperature/PAR/LAI histories are built up from a
+      # cold start during the run and the day of year comes from the driver clock. For fixed
+      # scalar histories set history_mode: fixed and supply day_of_year, temperature_history_k,
+      # par_history_wm2 and a leaf_area_index_prev field.
       emission_classes:
         ISOP:
           ldf: 0.9996
@@ -248,6 +251,7 @@ cece_data:
       data_model: auto
       variables:
         - { file: LAI, model: leaf_area_index }
+        # Used only with history_mode: fixed; the default evolving mode tracks previous-day LAI itself.
         - { file: LAI_PREV, model: leaf_area_index_prev }
 
 output:

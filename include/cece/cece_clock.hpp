@@ -26,11 +26,13 @@ struct ClockComponent {
  */
 struct StepResult {
     std::vector<const ClockComponent*> due_components;  ///< ordered: streams, physics schemes, stacking
-    int elapsed_seconds;                                ///< total seconds since start_time
-    int hour_of_day;                                    ///< 0-23
-    int day_of_week;                                    ///< 0-6, Sunday=0
-    int month;                                          ///< 0-11
-    bool simulation_complete;
+    int elapsed_seconds = 0;                            ///< total seconds since start_time
+    int hour_of_day = 0;                                ///< 0-23
+    int day_of_week = 0;                                ///< 0-6, Sunday=0
+    int month = 0;                                      ///< 0-11
+    int day_of_year = 1;                                ///< 1-366 (UTC)
+    int64_t utc_epoch_seconds = 0;                      ///< Current UTC instant in Unix seconds
+    bool simulation_complete = false;
 };
 
 /**
@@ -100,7 +102,7 @@ class CeceClock {
     /**
      * @brief Extracts hour, day-of-week, and month from absolute epoch seconds.
      */
-    static void DecomposeTime(int64_t epoch_secs, int& hour, int& dow, int& month);
+    static void DecomposeTime(int64_t epoch_secs, int& hour, int& day_of_week, int& month, int& day_of_year);
 
     /**
      * @brief Converts ISO8601 "YYYY-MM-DDTHH:MM:SS" string to epoch seconds.

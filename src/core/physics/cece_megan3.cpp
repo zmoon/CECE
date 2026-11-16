@@ -67,6 +67,28 @@ void Megan3Scheme::Initialize(const conf::Value& config, CeceDiagnosticManager* 
     // Call base class to parse input_mapping, output_mapping, diagnostics
     BasePhysicsScheme::Initialize(config, diag_manager);
     history_ = MeganHistory::FromConfig(config);
+    const std::string history_mode = config["history_mode"].string_or("evolving");
+    if (history_mode != "evolving" && history_mode != "fixed") {
+        throw std::invalid_argument("Megan3Scheme: history_mode must be 'evolving' or 'fixed'");
+    }
+    history_evolving_ = history_mode == "evolving";
+    if (history_evolving_) {
+        for (const char* key : {"day_of_year", "days_between_lai", "leaf_age_uses_temperature_history"}) {
+            if (config[key].is_defined()) {
+                CECE_LOG_WARNING(std::string("Megan3Scheme: ") + key +
+                                 " is ignored with history_mode: evolving (the CECE clock and HEMCO leaf-age convention are used)");
+            }
+        }
+    }
+    evolving_temperature_init_k_ = config["temperature_history_k"].is_defined() ? history_.temperature_k : hemco_megan::v3_12_1::kTemperatureHistoryK;
+    if (config["par_history_wm2"].is_defined()) {
+        evolving_par_direct_init_wm2_ = 0.0;
+        evolving_par_diffuse_init_wm2_ = history_.par_wm2;
+    } else {
+        evolving_par_direct_init_wm2_ = hemco_megan::v3_12_1::kParDirectHistoryWm2;
+        evolving_par_diffuse_init_wm2_ = hemco_megan::v3_12_1::kParDiffuseHistoryWm2;
+    }
+    history_state_ = MeganHistoryState{};
 
     // ---- Load speciation configuration ----
     std::string mechanism_path = "data/speciation/spc_cb6.yaml";
@@ -134,6 +156,10 @@ void Megan3Scheme::Initialize(const conf::Value& config, CeceDiagnosticManager* 
 // ============================================================================
 
 void Megan3Scheme::Run(CeceImportState& import_state, CeceExportState& export_state) {
+    Run(import_state, export_state, SchemeRunContext{});
+}
+
+void Megan3Scheme::Run(CeceImportState& import_state, CeceExportState& export_state, const SchemeRunContext& context) {
     // ---- Resolve required import fields ----
     auto temp = ResolveImport("temperature", import_state);
     auto lai = ResolveImport("leaf_area_index", import_state);
@@ -177,6 +203,11 @@ void Megan3Scheme::Run(CeceImportState& import_state, CeceExportState& export_st
     }
 
     int num_cells = nx * ny;
+    if (history_evolving_) {
+        MeganHistoryState::RequireClock("Megan3Scheme", context.dt_seconds, context.day_of_year);
+        history_state_.InitializeIfNeeded(nx, ny, lai, evolving_temperature_init_k_, hemco_megan::v3_12_1::kTemperatureHistoryK,
+                                          evolving_par_direct_init_wm2_, evolving_par_diffuse_init_wm2_);
+    }
 
     // ---- Resolve per-class AEF fields from import state ----
     // Try to find AEF_<CLASS_NAME> in import state; use default_aef_ if missing
@@ -242,6 +273,15 @@ void Megan3Scheme::Run(CeceImportState& import_state, CeceExportState& export_st
     bool enable_temp_stress = activity_calc_.enable_temp_stress_;
 
     const auto history = history_;
+    const bool evolving_history = history_evolving_;
+    const auto temperature_history_view = history_state_.temperature_5day;
+    const auto par_direct_history_view = history_state_.par_direct_5day;
+    const auto par_diffuse_history_view = history_state_.par_diffuse_5day;
+    const auto lai_previous_view = history_state_.lai_12hour;
+    const double fixed_temperature_history = history.temperature_k;
+    const double fixed_par_history = history.par_wm2;
+    const double fixed_days_between_lai = history.days_between_lai;
+    const int history_doy = history_evolving_ ? context.day_of_year : history.day_of_year;
 
     // Standard constants (matching MeganScheme)
     constexpr double NORM_FAC = 1.0 / 1.0101081;
@@ -290,14 +330,13 @@ void Megan3Scheme::Run(CeceImportState& import_state, CeceExportState& export_st
                 return;
             }
 
-            // Effective scalar histories; state evolution belongs upstream.
-            const double T_AVG_15 = history.temperature_k;
-            const double PAR_AVG = history.par_wm2;
-            const int doy = history.day_of_year;
-            const double dbtwn = history.days_between_lai;
-            const double age_temperature = history.leaf_age_uses_history ? T_AVG_15 : T;
+            const double T_AVG_15 = evolving_history ? temperature_history_view(i, j, 0) : fixed_temperature_history;
+            const double PAR_AVG = evolving_history ? par_direct_history_view(i, j, 0) + par_diffuse_history_view(i, j, 0) : fixed_par_history;
+            const int doy = history_doy;
+            const double dbtwn = evolving_history ? hemco_megan::v3_12_1::kDaysBetweenLai : fixed_days_between_lai;
+            const double age_temperature = evolving_history ? T_AVG_15 : (history.leaf_age_uses_history ? T_AVG_15 : T);
 
-            double L_prev = has_lai_prev ? lai_prev(i, j, 0) : L;
+            double L_prev = evolving_history ? lai_previous_view(i, j, 0) : (has_lai_prev ? lai_prev(i, j, 0) : L);
             double gwet = has_soil_moist ? soil_moisture(i, j, 0) : 1.0;
             double ws = has_wind ? wind_speed(i, j, 0) : 0.0;
 
@@ -358,6 +397,9 @@ void Megan3Scheme::Run(CeceImportState& import_state, CeceExportState& export_st
     speciation_engine_.Run(const_class_totals, export_state, nx, ny);
 
     Kokkos::fence();
+    if (history_evolving_) {
+        history_state_.Update(temp, par_direct, par_diffuse, lai, context.dt_seconds);
+    }
 
     // ---- Mark all export fields as modified ----
     for (const auto& field_name : export_field_names_) {

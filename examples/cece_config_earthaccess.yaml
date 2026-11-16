@@ -75,7 +75,8 @@ cece_data:
 
     # ------------------------------------------------------------------
     # Previous Leaf Area Index — same MERRA-2 collection, prior window
-    # Provides: leaf_area_index_prev (MEGAN3 leaf-age response)
+    # Provides: leaf_area_index_prev (used only with history_mode: fixed; the default
+    # evolving mode tracks previous-day LAI itself)
     # ------------------------------------------------------------------
     - name: merra2_lai_previous
       source: earthaccess

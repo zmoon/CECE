@@ -60,18 +60,20 @@ int64_t CeceClock::ParseISO8601(const std::string& iso) {
 // DecomposeTime
 // ---------------------------------------------------------------------------
 
-void CeceClock::DecomposeTime(int64_t epoch_secs, int& hour, int& dow, int& month) {
+void CeceClock::DecomposeTime(int64_t epoch_secs, int& hour, int& day_of_week, int& month, int& day_of_year) {
     std::time_t t = static_cast<std::time_t>(epoch_secs);
     std::tm* gm = std::gmtime(&t);
     if (!gm) {
         hour = 0;
-        dow = 0;
+        day_of_week = 0;
         month = 0;
+        day_of_year = 1;
         return;
     }
-    hour = gm->tm_hour;  // 0-23
-    dow = gm->tm_wday;   // 0-6, Sunday=0
-    month = gm->tm_mon;  // 0-11
+    hour = gm->tm_hour;         // 0-23
+    day_of_week = gm->tm_wday;  // 0-6, Sunday=0
+    month = gm->tm_mon;         // 0-11
+    day_of_year = gm->tm_yday + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +130,8 @@ StepResult CeceClock::Advance() {
     if (IsComplete()) {
         result.elapsed_seconds = static_cast<int>(elapsed_seconds_);
         result.simulation_complete = true;
-        DecomposeTime(start_epoch_secs_ + elapsed_seconds_, result.hour_of_day, result.day_of_week, result.month);
+        result.utc_epoch_seconds = start_epoch_secs_ + elapsed_seconds_;
+        DecomposeTime(result.utc_epoch_seconds, result.hour_of_day, result.day_of_week, result.month, result.day_of_year);
         return result;
     }
 
@@ -137,9 +140,10 @@ StepResult CeceClock::Advance() {
 
     result.elapsed_seconds = static_cast<int>(elapsed_seconds_);
     result.simulation_complete = IsComplete();
+    result.utc_epoch_seconds = start_epoch_secs_ + elapsed_seconds_;
 
     // Calendar decomposition from absolute time
-    DecomposeTime(start_epoch_secs_ + elapsed_seconds_, result.hour_of_day, result.day_of_week, result.month);
+    DecomposeTime(result.utc_epoch_seconds, result.hour_of_day, result.day_of_week, result.month, result.day_of_year);
 
     bool is_first_step = (elapsed_seconds_ == base_timestep_secs_);
 

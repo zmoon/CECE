@@ -11,7 +11,7 @@
  * or another soil NO scheme) rather than computing it internally.
  *
  * Registered as "megan3" via PhysicsRegistration. The existing "megan" scheme
- * remains unchanged for backward compatibility.
+ * remains a separate single-species scheme.
  */
 
 #include <Kokkos_Core.hpp>
@@ -57,9 +57,15 @@ class Megan3Scheme : public BasePhysicsScheme {
 
     void Initialize(const conf::Value& config, CeceDiagnosticManager* diag_manager) override;
     void Run(CeceImportState& import_state, CeceExportState& export_state) override;
+    void Run(CeceImportState& import_state, CeceExportState& export_state, const SchemeRunContext& context) override;
 
    private:
     MeganHistory history_;
+    bool history_evolving_ = true;
+    double evolving_temperature_init_k_ = hemco_megan::v3_12_1::kTemperatureHistoryK;
+    double evolving_par_direct_init_wm2_ = hemco_megan::v3_12_1::kParDirectHistoryWm2;
+    double evolving_par_diffuse_init_wm2_ = hemco_megan::v3_12_1::kParDiffuseHistoryWm2;
+    MeganHistoryState history_state_;
     /// @name Sub-components
     /// @{
     CanopyModel canopy_model_;

@@ -1,6 +1,6 @@
 /**
  * @file test_hemco_megan_runtime.cpp
- * @brief Source-conformance tests for stateless HEMCO 3.12.1 MEGAN isoprene arithmetic.
+ * @brief Source-conformance and evolving-history tests for HEMCO 3.12.1 MEGAN isoprene.
  *
  * The implementation and oracle are separate-language transcriptions of the
  * pinned HEMCO source identified in tests/data/hemco_megan/README.md. These are
@@ -251,6 +251,7 @@ class HEMCO3121MeganRuntime : public ::testing::Test {
 
     static std::string RuntimeConfig(bool apply_co2_inhibition = true) {
         return std::string("megan_method: hemco_3_12_1\n") +
+               "history_mode: fixed\n"
                "aef: 2.5e-9\n"
                "export_field_name: runtime_isoprene\n"
                "hemco_co2_ppm: 415.0\n"
@@ -281,9 +282,9 @@ class HEMCO3121MeganRuntime : public ::testing::Test {
         scalar.suncos = input.solar_cosine;
         scalar.co2_ppm = kRuntimeCO2Ppm;
         scalar.apply_co2_inhibition = apply_co2_inhibition;
-        scalar.pardr_history_Wm2 = static_cast<double>(static_cast<float>(kRuntimeParDirectHistoryWm2));
-        scalar.pardf_history_Wm2 = static_cast<double>(static_cast<float>(kRuntimeParDiffuseHistoryWm2));
-        scalar.temperature_history_K = static_cast<double>(static_cast<float>(kRuntimeTemperatureHistoryK));
+        scalar.pardr_history_Wm2 = kRuntimeParDirectHistoryWm2;
+        scalar.pardf_history_Wm2 = kRuntimeParDiffuseHistoryWm2;
+        scalar.temperature_history_K = kRuntimeTemperatureHistoryK;
         scalar.days_between_lai = kDaysBetweenLai;
         scalar.doy = kRuntimeDoy;
         return scalar;
@@ -357,7 +358,7 @@ TEST_F(HEMCO3121MeganRuntime, MissingPreviousLaiFailsClosed) {
     EXPECT_THROW(scheme.Run(states.import_state, states.export_state), std::runtime_error);
 }
 
-TEST_F(HEMCO3121MeganRuntime, ConfiguredHistoriesUseFloatProjection) {
+TEST_F(HEMCO3121MeganRuntime, ConfiguredHistoriesRetainDoublePrecision) {
     const CellInputs input;
     auto states = MakeStates(input);
     auto config = conf::Config::from_string(RuntimeConfig());
@@ -367,15 +368,137 @@ TEST_F(HEMCO3121MeganRuntime, ConfiguredHistoriesUseFloatProjection) {
     scheme.Run(states.import_state, states.export_state);
 
     const double runtime_value = ReadOutput(states);
-    const double projected_expected = kRuntimeAef * IsopreneEmissionFactor(ScalarInputs(input));
-    ExpectScalarMatch(runtime_value, projected_expected);
+    const double expected = kRuntimeAef * IsopreneEmissionFactor(ScalarInputs(input));
+    ExpectScalarMatch(runtime_value, expected);
 
-    MeganInputs unprojected = ScalarInputs(input);
-    unprojected.pardr_history_Wm2 = kRuntimeParDirectHistoryWm2;
-    unprojected.pardf_history_Wm2 = kRuntimeParDiffuseHistoryWm2;
-    unprojected.temperature_history_K = kRuntimeTemperatureHistoryK;
-    const double unprojected_expected = kRuntimeAef * IsopreneEmissionFactor(unprojected);
-    EXPECT_NE(projected_expected, unprojected_expected);
+    MeganInputs projected = ScalarInputs(input);
+    projected.pardr_history_Wm2 = static_cast<double>(static_cast<float>(kRuntimeParDirectHistoryWm2));
+    projected.pardf_history_Wm2 = static_cast<double>(static_cast<float>(kRuntimeParDiffuseHistoryWm2));
+    projected.temperature_history_K = static_cast<double>(static_cast<float>(kRuntimeTemperatureHistoryK));
+    const double projected_expected = kRuntimeAef * IsopreneEmissionFactor(projected);
+    EXPECT_NE(expected, projected_expected);
+}
+
+TEST_F(HEMCO3121MeganRuntime, EvolvingHistoryColdStartsAndUpdatesAfterEmission) {
+    CellInputs input;
+    input.temperature_k = 310.0;
+    input.lai_prev = input.lai;
+    const double initial_lai = input.lai;
+    auto states = MakeStates(input, false);
+    std::string evolving_config = ReplaceSetting(RuntimeConfig(), "history_mode: fixed", "history_mode: evolving");
+    evolving_config = ReplaceSetting(evolving_config, "hemco_day_of_year: 200\n", "");
+    auto config = conf::Config::from_string(evolving_config);
+
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.elapsed_seconds = 3600;
+    context.day_of_year = kRuntimeDoy + 1;
+    scheme.Run(states.import_state, states.export_state, context);
+
+    MeganInputs cold_start = ScalarInputs(input);
+    cold_start.lai_prev = input.lai;
+    cold_start.temperature_history_K = kRuntimeTemperatureHistoryK;
+    cold_start.pardr_history_Wm2 = kRuntimeParDirectHistoryWm2;
+    cold_start.pardf_history_Wm2 = kRuntimeParDiffuseHistoryWm2;
+    cold_start.doy = context.day_of_year;
+    const double first_expected = kRuntimeAef * IsopreneEmissionFactor(cold_start);
+    SCOPED_TRACE("cold-start emission");
+    ExpectScalarMatch(ReadOutput(states), first_expected);
+
+    input.lai = 5.0;
+    auto& lai_field = states.import_state.fields.at("leaf_area_index");
+    Kokkos::deep_copy(lai_field.view_host(), input.lai);
+    lai_field.modify_host();
+    lai_field.sync_device();
+    context.elapsed_seconds = 7200;
+    scheme.Run(states.import_state, states.export_state, context);
+
+    const double day_fraction = 3600.0 / (5.0 * 24.0 * 3600.0);
+    MeganInputs updated = cold_start;
+    updated.temperature_history_K = (1.0 - day_fraction) * kRuntimeTemperatureHistoryK + day_fraction * input.temperature_k;
+    updated.pardr_history_Wm2 = (1.0 - day_fraction) * kRuntimeParDirectHistoryWm2 + day_fraction * input.par_direct_wm2;
+    updated.pardf_history_Wm2 = (1.0 - day_fraction) * kRuntimeParDiffuseHistoryWm2 + day_fraction * input.par_diffuse_wm2;
+    updated.lai = input.lai;
+    updated.lai_prev = initial_lai;
+    const double second_expected = kRuntimeAef * IsopreneEmissionFactor(updated);
+    SCOPED_TRACE("updated-history emission");
+    ExpectScalarMatch(ReadOutput(states), second_expected);
+    EXPECT_NE(first_expected, second_expected);
+
+    const double short_fraction = 3600.0 / (12.0 * 3600.0);
+    updated.temperature_history_K = (1.0 - day_fraction) * updated.temperature_history_K + day_fraction * input.temperature_k;
+    updated.pardr_history_Wm2 = (1.0 - day_fraction) * updated.pardr_history_Wm2 + day_fraction * input.par_direct_wm2;
+    updated.pardf_history_Wm2 = (1.0 - day_fraction) * updated.pardf_history_Wm2 + day_fraction * input.par_diffuse_wm2;
+    updated.lai_prev = (1.0 - short_fraction) * initial_lai + short_fraction * input.lai;
+    context.elapsed_seconds = 10800;
+    scheme.Run(states.import_state, states.export_state, context);
+    const double third_expected = kRuntimeAef * IsopreneEmissionFactor(updated);
+    SCOPED_TRACE("updated-LAI-history emission");
+    ExpectScalarMatch(ReadOutput(states), third_expected);
+}
+
+TEST_F(HEMCO3121MeganRuntime, EvolvingHistoryRequiresSchedulerClock) {
+    auto states = MakeStates(CellInputs{}, false);
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "history_mode: fixed", "history_mode: evolving"));
+
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state), std::runtime_error) << "no run context";
+
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state, context), std::runtime_error) << "missing day of year";
+
+    context.day_of_year = kRuntimeDoy;
+    context.dt_seconds = 0;
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state, context), std::runtime_error) << "missing dt";
+}
+
+TEST_F(HEMCO3121MeganRuntime, EvolvingHistoryClampsLongStepsInsteadOfFailing) {
+    CellInputs input;
+    auto states = MakeStates(input, false);
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "history_mode: fixed", "history_mode: evolving"));
+    const auto set_lai = [&states](double value) {
+        auto& field = states.import_state.fields.at("leaf_area_index");
+        Kokkos::deep_copy(field.view_host(), value);
+        field.modify_host();
+        field.sync_device();
+    };
+
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    SchemeRunContext context;
+    context.day_of_year = kRuntimeDoy;
+
+    context.dt_seconds = 3600;
+    scheme.Run(states.import_state, states.export_state, context);
+
+    constexpr double kLaiB = 5.0;
+    set_lai(kLaiB);
+    context.dt_seconds = 86400;  // twice the 12-hour e-folding time
+    EXPECT_NO_THROW(scheme.Run(states.import_state, states.export_state, context));
+
+    input.lai = 3.0;
+    set_lai(input.lai);
+    context.dt_seconds = 3600;
+    scheme.Run(states.import_state, states.export_state, context);
+
+    // The 86400 s update clamps its weight at 1, so the 12-hour LAI history is exactly the previous
+    // sample; the 5-day histories use the unclamped 0.2 weight.
+    const auto roll = [](double initial, double sample) {
+        const double first = 3600.0 / (5.0 * 86400.0);
+        const double second = 86400.0 / (5.0 * 86400.0);
+        const double after_first = (1.0 - first) * initial + first * sample;
+        return (1.0 - second) * after_first + second * sample;
+    };
+    MeganInputs expected = ScalarInputs(input);
+    expected.lai_prev = kLaiB;
+    expected.temperature_history_K = roll(kRuntimeTemperatureHistoryK, input.temperature_k);
+    expected.pardr_history_Wm2 = roll(kRuntimeParDirectHistoryWm2, input.par_direct_wm2);
+    expected.pardf_history_Wm2 = roll(kRuntimeParDiffuseHistoryWm2, input.par_diffuse_wm2);
+    ExpectScalarMatch(ReadOutput(states), kRuntimeAef * IsopreneEmissionFactor(expected));
 }
 
 TEST_F(HEMCO3121MeganRuntime, CO2ToggleReachesKokkosKernel) {
@@ -405,6 +528,7 @@ TEST_F(HEMCO3121MeganRuntime, CO2ToggleReachesKokkosKernel) {
 TEST_F(HEMCO3121MeganRuntime, RejectsInvalidConfiguration) {
     const std::vector<std::pair<std::string, std::string>> invalid_configs = {
         {"unknown method", "megan_method: unknown\n"},
+        {"unknown history mode", ReplaceSetting(RuntimeConfig(), "history_mode: fixed", "history_mode: unsupported")},
         {"CO2 below supported range", ReplaceSetting(RuntimeConfig(), "hemco_co2_ppm: 415.0", "hemco_co2_ppm: 149.0")},
         {"negative direct PAR history",
          ReplaceSetting(RuntimeConfig(), "hemco_par_direct_history_wm2: 31.234567891", "hemco_par_direct_history_wm2: -1.0")},
@@ -533,6 +657,7 @@ TEST_F(HEMCO3121MeganRuntime, ValidAliasesAndPrimaryPrecedencePreserveConfigured
 TEST_F(HEMCO3121MeganRuntime, QuotedConvertibleScalarsPreserveConfiguredValues) {
     const std::string yaml =
         "megan_method: 'hemco_3_12_1'\n"
+        "history_mode: 'fixed'\n"
         "aef: '2.5e-9'\n"
         "export_field_name: 'runtime_isoprene'\n"
         "hemco_co2_ppm: '415.0'\n"
@@ -551,20 +676,25 @@ TEST_F(HEMCO3121MeganRuntime, QuotedConvertibleScalarsPreserveConfiguredValues) 
 }
 
 TEST_F(HEMCO3121MeganRuntime, AbsentOptionalSettingsRetainColdStartDefaults) {
-    auto config = conf::Config::from_string("megan_method: hemco_3_12_1\naef: 2.5e-9\nhemco_day_of_year: 200\nhemco_co2_inhibition: false\n");
+    // Evolving is the default, so no explicit history or day-of-year settings are needed.
+    auto config = conf::Config::from_string("megan_method: hemco_3_12_1\naef: 2.5e-9\nhemco_co2_inhibition: false\n");
     const CellInputs input;
-    auto states = MakeStates(input);
+    auto states = MakeStates(input, false);
     auto& output = states.export_state.fields["isoprene_emissions"];
     output = MakeField("default_isoprene_output", 0.0);
     MeganScheme scheme;
     scheme.Initialize(config.root(), nullptr);
-    scheme.Run(states.import_state, states.export_state);
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.day_of_year = kRuntimeDoy;
+    scheme.Run(states.import_state, states.export_state, context);
 
     MeganInputs scalar = ScalarInputs(input, false);
     scalar.co2_ppm = 390.0;
-    scalar.pardr_history_Wm2 = static_cast<double>(static_cast<float>(kParDirectHistoryWm2));
-    scalar.pardf_history_Wm2 = static_cast<double>(static_cast<float>(kParDiffuseHistoryWm2));
-    scalar.temperature_history_K = static_cast<double>(static_cast<float>(kTemperatureHistoryK));
+    scalar.lai_prev = input.lai;
+    scalar.pardr_history_Wm2 = kParDirectHistoryWm2;
+    scalar.pardf_history_Wm2 = kParDiffuseHistoryWm2;
+    scalar.temperature_history_K = kTemperatureHistoryK;
     output.sync_host();
     ExpectScalarMatch(output.view_host()(0, 0, 0), kRuntimeAef * IsopreneEmissionFactor(scalar));
     EXPECT_DOUBLE_EQ(ReadOutput(states), 0.0) << "The absent export field setting must select isoprene_emissions";
@@ -583,7 +713,6 @@ TEST_F(HEMCO3121MeganRuntime, RejectsObsoleteHistoryKeys) {
 TEST_F(HEMCO3121MeganRuntime, RequiredSourceContractSettingsFailClosed) {
     const std::vector<std::pair<std::string, std::string>> incomplete_configs = {
         {"effective AEF", "megan_method: hemco_3_12_1\nhemco_day_of_year: 171\nhemco_co2_inhibition: false\n"},
-        {"day of year", "megan_method: hemco_3_12_1\naef: 1.0e-9\nhemco_co2_inhibition: false\n"},
         {"CO2 switch", "megan_method: hemco_3_12_1\naef: 1.0e-9\nhemco_day_of_year: 171\n"},
         {"CO2 concentration", "megan_method: hemco_3_12_1\naef: 1.0e-9\nhemco_day_of_year: 171\nhemco_co2_inhibition: true\n"},
     };
@@ -594,6 +723,10 @@ TEST_F(HEMCO3121MeganRuntime, RequiredSourceContractSettingsFailClosed) {
         MeganScheme scheme;
         EXPECT_THROW(scheme.Initialize(config.root(), nullptr), std::invalid_argument);
     }
+
+    auto fixed_without_day = conf::Config::from_string("megan_method: hemco_3_12_1\nhistory_mode: fixed\naef: 1.0e-9\nhemco_co2_inhibition: false\n");
+    MeganScheme fixed_scheme;
+    EXPECT_THROW(fixed_scheme.Initialize(fixed_without_day.root(), nullptr), std::invalid_argument);
 
     auto disabled_config =
         conf::Config::from_string("megan_method: hemco_3_12_1\naef: 1.0e-9\nhemco_day_of_year: 171\nhemco_co2_inhibition: false\n");

@@ -11,16 +11,16 @@
 #include <stdexcept>
 #include <string>
 
+#include "cece/physics/cece_megan_history.hpp"
 #include "cece/physics_scheme.hpp"
 
 /**
  * @section hemco_reference HEMCO 3.12.1 source-pinned calculation
- * @brief Device-callable stateless HEMCO 3.12.1 MEGAN isoprene equations.
+ * @brief Device-callable HEMCO 3.12.1 MEGAN isoprene equations.
  *
- * This layer contains no I/O, regridding, or persistent averaging state.
- * All state-dependent quantities (historical temperature, historical direct
- * and diffuse PAR, previous-day LAI, and day-of-year) are supplied as
- * arguments. This evaluates one cell without evolving HEMCO restart state.
+ * The scalar helpers contain no I/O, regridding, or persistent averaging
+ * state. MeganScheme owns per-cell histories and passes their current values
+ * to these helpers.
  *
  * Science source: HEMCO 3.12.1, hcox_megan_mod.F90
  * Repository:     https://github.com/geoschem/HEMCO
@@ -38,13 +38,13 @@
  *
  * Scope and limits
  * ----------------
- * The stateless mode defaults to HEMCO's no-restart initialization values:
- * REAL(sp)-projected 288.15 K historical temperature, 30 W m⁻² historical direct PAR, and
- * 48 W m⁻² historical diffuse PAR. The selected reference case enables CO₂
+ * Fixed-history mode defaults to HEMCO's no-restart initialization values:
+ * 288.15 K historical temperature, 30 W m⁻² historical direct PAR, and
+ * 48 W m⁻² historical diffuse PAR. Evolving runtime mode starts from these
+ * values and updates them after each emission calculation. The selected reference case enables CO₂
  * inhibition at 390 ppm; those two choices are explicit inputs, not universal
  * HEMCO constants.
  * This implementation does not reproduce:
- *   - State evolution with HEMCO's 5-day and 12-hour e-folding updates.
  *   - HEMCO's latitude/local-time solar-angle calculation; `suncos` must be
  *     the effective sine of solar elevation (equivalently cosine of zenith).
  *   - Gridded PFT/AEF and normalized-LAI preprocessing. Callers supply an
@@ -326,15 +326,13 @@ KOKKOS_INLINE_FUNCTION double IsopreneEmissionFactor(const MeganInputs& in) noex
 
 namespace cece {
 
-// Shared MEGAN configuration and units, not a rolling-history calculator.
-// CeceDiagnosticManager registers/writes diagnostic fields; these settings
-// only validate caller-supplied effective histories for stateless execution.
+// Shared MEGAN configuration and units. MeganScheme and Megan3Scheme own
+// their respective evolving per-cell history state.
 
-/// Scalar effective histories for native C++ MEGAN and MEGAN3.
-/// Defaults preserve the previous behavior; no history evolution is performed.
+/// Scalar fixed histories for native C++ MEGAN and MEGAN3.
 struct MeganHistory {
     double temperature_k = 297.0;
-    double par_wm2 = 400.0;
+    double par_wm2 = 78.0;
     double days_between_lai = 30.0;
     int day_of_year = 180;
     bool leaf_age_uses_history = false;
@@ -497,14 +495,14 @@ double get_gamma_co2(double co2a, double c1, double c2, bool use_wilkinson) {
  * Supported `megan_method` values:
  *   - `"megan21"` (default) - fully configurable MEGAN2.1 isoprene calculation.
  *     `"native"` remains a compatibility alias with identical behavior.
- *   - `"hemco_3_12_1"` — source-pinned HEMCO 3.12.1 stateless cell arithmetic
+ *   - `"hemco_3_12_1"` — source-pinned HEMCO 3.12.1 isoprene calculation
  *     using the frozen HEMCO constants and equations above. All megan21-mode
- *     tuning parameters are ignored. HEMCO restart-derived temperature and
- *     direct/diffuse PAR histories are explicit scalar options in this mode;
- *     the mode consumes them but does not evolve them. HEMCO's one-day LAI
- *     interval remains fixed by the source contract. The caller must provide
- *     exact effective current and previous-day LAI after upstream HEMCO
- *     preprocessing; CECE does not reconstruct or re-round those fields.
+ *     tuning parameters are ignored. Per-cell temperature, direct/diffuse PAR,
+ *     and LAI histories evolve by default from HEMCO's no-restart values;
+ *     `history_mode: fixed` selects explicit scalar histories. HEMCO's one-day LAI
+ *     interval remains fixed by the source contract. The caller provides
+ *     current LAI after any desired upstream preprocessing; previous-day LAI
+ *     is required only in fixed-history mode.
  */
 class MeganScheme : public BasePhysicsScheme {
    public:
@@ -513,6 +511,7 @@ class MeganScheme : public BasePhysicsScheme {
 
     void Initialize(const conf::Value& config, CeceDiagnosticManager* diag_manager) override;
     void Run(CeceImportState& import_state, CeceExportState& export_state) override;
+    void Run(CeceImportState& import_state, CeceExportState& export_state, const SchemeRunContext& context) override;
 
    private:
     // ---- Emission method selection ----
@@ -521,10 +520,12 @@ class MeganScheme : public BasePhysicsScheme {
     // ---- HEMCO 3.12.1 source-conformance-mode settings ----
     double hemco_co2_ppm_ = 390.0;  ///< selected reference-case CO₂ [ppm]
     bool hemco_co2_inhibition_ = true;
+    bool hemco_history_evolving_ = true;
     double hemco_par_direct_history_wm2_ = hemco_megan::v3_12_1::kParDirectHistoryWm2;
     double hemco_par_diffuse_history_wm2_ = hemco_megan::v3_12_1::kParDiffuseHistoryWm2;
     double hemco_temperature_history_k_ = hemco_megan::v3_12_1::kTemperatureHistoryK;
     int hemco_day_of_year_ = hemco_megan::v3_12_1::kReferenceDoy;
+    MeganHistoryState hemco_history_state_;
 
     // ---- Configurable MEGAN2.1 parameters (ignored in hemco_3_12_1 mode) ----
     MeganHistory history_;
