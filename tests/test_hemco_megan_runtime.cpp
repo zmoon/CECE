@@ -261,6 +261,7 @@ class HEMCO3121MeganRuntime : public ::testing::Test {
         return std::string("megan_method: hemco_3_12_1\n") +
                "history_mode: fixed\n"
                "hemco_solar_angle_mode: supplied\n"
+               "hemco_normalize_lai: false\n"
                "aef: 2.5e-9\n"
                "export_field_name: runtime_isoprene\n"
                "hemco_co2_ppm: 415.0\n"
@@ -563,6 +564,7 @@ TEST_F(HEMCO3121MeganRuntime, ExplicitNumericAndBooleanSettingsRejectMalformedVa
         {"aef", "2.5e-9"},
         {"hemco_day_of_year", "200"},
         {"hemco_co2_inhibition", "true"},
+        {"hemco_normalize_lai", "false"},
         {"hemco_co2_ppm", "415.0"},
         {"hemco_par_direct_history_wm2", "31.234567891"},
         {"hemco_par_diffuse_history_wm2", "47.543210987"},
@@ -668,6 +670,7 @@ TEST_F(HEMCO3121MeganRuntime, QuotedConvertibleScalarsPreserveConfiguredValues) 
         "megan_method: 'hemco_3_12_1'\n"
         "history_mode: 'fixed'\n"
         "hemco_solar_angle_mode: 'supplied'\n"
+        "hemco_normalize_lai: 'false'\n"
         "aef: '2.5e-9'\n"
         "export_field_name: 'runtime_isoprene'\n"
         "hemco_co2_ppm: '415.0'\n"
@@ -687,8 +690,8 @@ TEST_F(HEMCO3121MeganRuntime, QuotedConvertibleScalarsPreserveConfiguredValues) 
 
 TEST_F(HEMCO3121MeganRuntime, AbsentOptionalSettingsRetainColdStartDefaults) {
     // Evolving is the default, so no explicit history or day-of-year settings are needed.
-    auto config =
-        conf::Config::from_string("megan_method: hemco_3_12_1\nhemco_solar_angle_mode: supplied\naef: 2.5e-9\nhemco_co2_inhibition: false\n");
+    auto config = conf::Config::from_string(
+        "megan_method: hemco_3_12_1\nhemco_solar_angle_mode: supplied\nhemco_normalize_lai: false\naef: 2.5e-9\nhemco_co2_inhibition: false\n");
     const CellInputs input;
     auto states = MakeStates(input, false);
     auto& output = states.export_state.fields["isoprene_emissions"];
@@ -902,6 +905,120 @@ TEST_F(HEMCO3121MeganRuntime, ClockSolarAngleRequiresClockAndGridCoordinates) {
     auto bad_mode = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "hemco_solar_angle_mode: supplied", "hemco_solar_angle_mode: bogus"));
     MeganScheme bad_scheme;
     EXPECT_THROW(bad_scheme.Initialize(bad_mode.root(), nullptr), std::invalid_argument);
+}
+
+TEST_F(HEMCO3121MeganRuntime, GriddedAefAndIsopreneScalingApplyPerCell) {
+    const CellInputs input;
+    auto states = MakeStates(input);
+    states.import_state.fields["aef_isoprene"] = MakeField("runtime_aef", 3.0e-9);
+    std::string yaml = ReplaceSetting(RuntimeConfig(), "aef: 2.5e-9", "hemco_aef_source: gridded\nhemco_isoprene_scaling: 1.5");
+    auto config = conf::Config::from_string(yaml);
+
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    scheme.Run(states.import_state, states.export_state);
+    ExpectScalarMatch(ReadOutput(states), 1.5 * 3.0e-9 * IsopreneEmissionFactor(ScalarInputs(input)));
+
+    // HEMCO zeroes the cell when LAI * AEF is not positive.
+    auto& aef_field = states.import_state.fields.at("aef_isoprene");
+    Kokkos::deep_copy(aef_field.view_host(), 0.0);
+    aef_field.modify_host();
+    aef_field.sync_device();
+    scheme.Run(states.import_state, states.export_state);
+    EXPECT_DOUBLE_EQ(ReadOutput(states), 0.0);
+}
+
+TEST_F(HEMCO3121MeganRuntime, GriddedAefFailsClosed) {
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "aef: 2.5e-9", "hemco_aef_source: gridded"));
+    // Schemes cache resolved fields, so each case gets its own instance.
+    const auto run_throws = [&config](OneCellStates& states) {
+        MeganScheme scheme;
+        scheme.Initialize(config.root(), nullptr);
+        try {
+            scheme.Run(states.import_state, states.export_state);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+
+    auto missing = MakeStates(CellInputs{});
+    EXPECT_TRUE(run_throws(missing)) << "missing aef_isoprene";
+
+    for (const double invalid_value : {-1.0e-9, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+        SCOPED_TRACE(invalid_value);
+        auto states = MakeStates(CellInputs{});
+        states.import_state.fields["aef_isoprene"] = MakeField("runtime_aef", invalid_value);
+        EXPECT_TRUE(run_throws(states));
+    }
+
+    auto wrong_shape = MakeStates(CellInputs{});
+    wrong_shape.import_state.fields["aef_isoprene"] = MakeField("runtime_aef", 1.0e-9, 2, 1, 1);
+    EXPECT_TRUE(run_throws(wrong_shape));
+
+    auto valid = MakeStates(CellInputs{});
+    valid.import_state.fields["aef_isoprene"] = MakeField("runtime_aef", 1.0e-9);
+    EXPECT_FALSE(run_throws(valid));
+
+    auto conflicting = conf::Config::from_string(RuntimeConfig() + "hemco_aef_source: gridded\n");
+    MeganScheme conflicting_scheme;
+    EXPECT_THROW(conflicting_scheme.Initialize(conflicting.root(), nullptr), std::invalid_argument) << "scalar aef with gridded source";
+
+    auto bad_source = conf::Config::from_string(RuntimeConfig() + "hemco_aef_source: bogus\n");
+    MeganScheme bad_scheme;
+    EXPECT_THROW(bad_scheme.Initialize(bad_source.root(), nullptr), std::invalid_argument);
+}
+
+TEST_F(HEMCO3121MeganRuntime, LaiNormalizationDividesByVegetatedPftSumAndCaps) {
+    const auto normalized_config = ReplaceSetting(RuntimeConfig(), "hemco_normalize_lai: false", "hemco_normalize_lai: true");
+    const auto run = [&normalized_config](const CellInputs& input, double pft_fraction_each) {
+        auto states = MakeStates(input);
+        for (const char* name : kVegetatedPftFields) {
+            states.import_state.fields[name] = MakeField(std::string("runtime_") + name, pft_fraction_each);
+        }
+        auto config = conf::Config::from_string(normalized_config);
+        MeganScheme scheme;
+        scheme.Initialize(config.root(), nullptr);
+        scheme.Run(states.import_state, states.export_state);
+        return ReadOutput(states);
+    };
+
+    // Sum of fractions is 0.6: current LAI 1.5 -> 2.5 and previous LAI 0.9 -> 1.5.
+    CellInputs input;
+    input.lai = 1.5;
+    input.lai_prev = 0.9;
+    CellInputs normalized = input;
+    normalized.lai = 1.5 / 0.6;
+    normalized.lai_prev = 0.9 / 0.6;
+    ExpectScalarMatch(run(input, 0.04), kRuntimeAef * IsopreneEmissionFactor(ScalarInputs(normalized)));
+
+    // LAI_MAX caps both values at 6.
+    CellInputs large;
+    large.lai = 4.0;
+    large.lai_prev = 3.9;
+    CellInputs capped = large;
+    capped.lai = kLaiMax;
+    capped.lai_prev = kLaiMax;
+    ExpectScalarMatch(run(large, 0.02), kRuntimeAef * IsopreneEmissionFactor(ScalarInputs(capped)));
+
+    // A zero PFT sum leaves LAI unnormalized, as in HEMCO.
+    ExpectScalarMatch(run(input, 0.0), kRuntimeAef * IsopreneEmissionFactor(ScalarInputs(input)));
+}
+
+TEST_F(HEMCO3121MeganRuntime, LaiNormalizationRequiresPftFields) {
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "hemco_normalize_lai: false", "hemco_normalize_lai: true"));
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+
+    auto states = MakeStates(CellInputs{});
+    for (const char* name : kVegetatedPftFields) {
+        states.import_state.fields[name] = MakeField(std::string("runtime_") + name, 0.04);
+    }
+    states.import_state.fields.erase("pft_c4_grss");
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state), std::runtime_error);
+
+    states.import_state.fields["pft_c4_grss"] = MakeField("runtime_c4", std::numeric_limits<double>::quiet_NaN());
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state), std::runtime_error) << "non-finite PFT fraction";
 }
 
 TEST_F(HEMCO3121MeganRuntime, Megan21SelectorsRetainMissingFieldNoOp) {

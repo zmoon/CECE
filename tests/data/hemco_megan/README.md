@@ -47,5 +47,6 @@ The vectors use spatially uniform scalar AEF and history settings. They do not
 cover HEMCO's evolving gridded 5-day/12-hour history state, restart
 equivalence, the solar-angle calculation from latitude/local time (the
 reference cases take the PAR sine via `hemco_solar_angle_mode: supplied`),
-gridded PFT/AEF preprocessing, or mixed-precision diagnostic output. The C++ tests use a
+and LAI normalization or gridded AEF (they use `hemco_normalize_lai: false`
+with a scalar AEF), or mixed-precision diagnostic output. The C++ tests use a
 relative tolerance of `1e-12` for the source-derived scalar values.

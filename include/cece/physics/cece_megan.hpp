@@ -51,10 +51,9 @@
  *     (default) `suncos` is only the day/night gate and the PAR-response sine
  *     comes from day of year, local hour and latitude; `supplied` uses
  *     `suncos` directly.
- *   - Gridded PFT/AEF and normalized-LAI preprocessing. Callers supply an
- *     effective AEF (including ISOP_SCALING where applicable) and separately
- *     supply current/previous LAI after any requested HEMCO normalization.
- *   - Non-isoprene species LDF/CT1/CEO values.
+ *   - Non-isoprene species: `CALC_AEF` generation of other compounds' AEFs from
+ *     PFT fractions, and their LDF/CT1/CEO values. Isoprene reads a scalar or
+ *     gridded AEF and applies HEMCO's PFT-based LAI normalization (default on).
  *   - Coupled upstream photosynthesis or stomatal conductance.
  */
 
@@ -105,6 +104,29 @@ inline constexpr double kEOptCoeff = 0.08;
 
 /** W m⁻² to µmol m⁻² s⁻¹ conversion factor for PAR. */
 inline constexpr double kWm2ToUmol = 4.766;
+
+/** Upper bound on PFT-normalized LAI (HEMCO LAI_MAX) [m² m⁻²]. */
+inline constexpr double kLaiMax = 6.0;
+
+/** Number of vegetated CLM4 PFTs (HEMCO PFT indices 2:16) summed for LAI normalization. */
+inline constexpr int kNumVegetatedPfts = 15;
+
+/** Canonical import names of the vegetated CLM4 PFT fractions, in HEMCO's ARRAY_16(:,:,2:16) order. */
+inline constexpr const char* kVegetatedPftFields[kNumVegetatedPfts] = {"pft_ndlf_evgn_tmpt_tree",
+                                                                       "pft_ndlf_evgn_borl_tree",
+                                                                       "pft_ndlf_decd_borl_tree",
+                                                                       "pft_bdlf_evgn_trop_tree",
+                                                                       "pft_bdlf_evgn_tmpt_tree",
+                                                                       "pft_bdlf_decd_trop_tree",
+                                                                       "pft_bdlf_decd_tmpt_tree",
+                                                                       "pft_bdlf_decd_borl_tree",
+                                                                       "pft_bdlf_evgn_shrb",
+                                                                       "pft_bdlf_decd_tmpt_shrb",
+                                                                       "pft_bdlf_decd_borl_shrb",
+                                                                       "pft_c3_arct_grss",
+                                                                       "pft_c3_narc_grss",
+                                                                       "pft_c4_grss",
+                                                                       "pft_crop"};
 
 /** PTOA baseline [µmol m⁻² s⁻¹]. */
 inline constexpr double kPtoaC1 = 3000.0;
@@ -554,6 +576,9 @@ class MeganScheme : public BasePhysicsScheme {
     bool hemco_co2_inhibition_ = true;
     bool hemco_history_evolving_ = true;
     std::string hemco_solar_angle_mode_ = "clock";
+    bool hemco_aef_gridded_ = false;
+    bool hemco_normalize_lai_ = true;
+    double hemco_isoprene_scaling_ = 1.0;
     double hemco_par_direct_history_wm2_ = hemco_megan::v3_12_1::kParDirectHistoryWm2;
     double hemco_par_diffuse_history_wm2_ = hemco_megan::v3_12_1::kParDiffuseHistoryWm2;
     double hemco_temperature_history_k_ = hemco_megan::v3_12_1::kTemperatureHistoryK;

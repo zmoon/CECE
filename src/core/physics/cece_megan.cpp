@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <numbers>
 #include <stdexcept>
 
@@ -70,8 +71,26 @@ void MeganScheme::Initialize(const conf::Value& config, CeceDiagnosticManager* d
         if (hemco_solar_angle_mode_ != "clock" && hemco_solar_angle_mode_ != "supplied") {
             throw std::invalid_argument("MeganScheme: hemco_solar_angle_mode must be 'clock' or 'supplied'");
         }
-        if (!config["aef"].is_defined() && !config["aef_isop"].is_defined()) {
-            throw std::invalid_argument("MeganScheme: hemco_3_12_1 mode requires an explicit effective 'aef'");
+        const bool has_scalar_aef = config["aef"].is_defined() || config["aef_isop"].is_defined();
+        const std::string aef_source =
+            config["hemco_aef_source"].is_defined() ? config["hemco_aef_source"].as_string() : (has_scalar_aef ? "scalar" : "");
+        if (aef_source != "scalar" && aef_source != "gridded") {
+            throw std::invalid_argument(
+                "MeganScheme: hemco_3_12_1 mode requires an explicit effective 'aef' or 'hemco_aef_source: gridded' (hemco_aef_source must be "
+                "'scalar' "
+                "or 'gridded')");
+        }
+        hemco_aef_gridded_ = aef_source == "gridded";
+        if (hemco_aef_gridded_ && has_scalar_aef) {
+            throw std::invalid_argument("MeganScheme: 'aef'/'aef_isop' conflicts with hemco_aef_source: gridded");
+        }
+        if (!hemco_aef_gridded_ && !has_scalar_aef) {
+            throw std::invalid_argument("MeganScheme: hemco_aef_source: scalar requires an explicit effective 'aef'");
+        }
+        hemco_normalize_lai_ = config["hemco_normalize_lai"].is_defined() ? config["hemco_normalize_lai"].as_bool() : true;
+        hemco_isoprene_scaling_ = config["hemco_isoprene_scaling"].is_defined() ? config["hemco_isoprene_scaling"].as_double() : 1.0;
+        if (!std::isfinite(hemco_isoprene_scaling_) || hemco_isoprene_scaling_ < 0.0) {
+            throw std::invalid_argument("MeganScheme: hemco_isoprene_scaling must be finite and nonnegative");
         }
         if (!hemco_history_evolving_ && !config["hemco_day_of_year"].is_defined()) {
             throw std::invalid_argument("MeganScheme: hemco_3_12_1 mode requires explicit 'hemco_day_of_year'");
@@ -115,10 +134,12 @@ void MeganScheme::Initialize(const conf::Value& config, CeceDiagnosticManager* d
             throw std::invalid_argument("MeganScheme: hemco_day_of_year must be in [1, 366]");
         }
 
-        // AEF and export field still read from config in hemco_3_12_1 mode.
-        aef_ = config["aef"].is_defined() ? config["aef"].as_double() : config["aef_isop"].as_double();
-        if (!std::isfinite(aef_) || aef_ < 0.0) {
-            throw std::invalid_argument("MeganScheme: effective aef must be finite and nonnegative");
+        // AEF and export field still read from config in hemco_3_12_1 mode; gridded AEF comes from the import field.
+        if (!hemco_aef_gridded_) {
+            aef_ = config["aef"].is_defined() ? config["aef"].as_double() : config["aef_isop"].as_double();
+            if (!std::isfinite(aef_) || aef_ < 0.0) {
+                throw std::invalid_argument("MeganScheme: effective aef must be finite and nonnegative");
+            }
         }
         species_name_ = config["species_name"].is_defined() ? config["species_name"].as_string() : "isoprene";
         if (species_name_ != "isoprene" && species_name_ != "ISOP") {
@@ -187,6 +208,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
 
     auto pmlai = ResolveImport("leaf_area_index_prev", import_state);
     auto gwetroot = ResolveImport("soil_moisture_root", import_state);
+    auto aef_field = ResolveImport("aef_isoprene", import_state);
 
     if (megan_method_ == "hemco_3_12_1") {
         const bool require_previous_lai = !hemco_history_evolving_;
@@ -196,6 +218,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
                                                         {MapInput("par_direct"), pardr.data() != nullptr},
                                                         {MapInput("par_diffuse"), pardf.data() != nullptr},
                                                         {MapInput("solar_cosine"), suncos.data() != nullptr},
+                                                        {MapInput("aef_isoprene"), !hemco_aef_gridded_ || aef_field.data() != nullptr},
                                                         {MapOutput(export_field_name_), emissions_out.data() != nullptr}});
     }
 
@@ -225,9 +248,59 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
         require_scalar_shape(pardf, MapInput("par_diffuse"));
         require_scalar_shape(suncos, MapInput("solar_cosine"));
         if (!hemco_history_evolving_) require_scalar_shape(pmlai, MapInput("leaf_area_index_prev"));
+        if (hemco_aef_gridded_) require_scalar_shape(aef_field, MapInput("aef_isoprene"));
 
         using CellPolicy = Kokkos::MDRangePolicy<Kokkos::DefaultExecutionSpace, Kokkos::Rank<2>>;
         const CellPolicy cells({0, 0}, {nx, ny});
+
+        // HEMCO divides LAI by the summed vegetated PFT fractions (ARRAY_16(:,:,2:16)); cells with a zero sum keep raw LAI.
+        Kokkos::View<double**, Kokkos::LayoutLeft, Kokkos::DefaultExecutionSpace> pft_sum;
+        if (hemco_normalize_lai_) {
+            pft_sum = decltype(pft_sum)("megan_hemco_pft_sum", nx, ny);
+            std::string missing_pfts;
+            for (const char* pft_name : hemco_megan::v3_12_1::kVegetatedPftFields) {
+                const auto pft = ResolveImport(pft_name, import_state);
+                if (pft.data() == nullptr) {
+                    missing_pfts += (missing_pfts.empty() ? "'" : ", '") + MapInput(pft_name) + "'";
+                    continue;
+                }
+                require_scalar_shape(pft, MapInput(pft_name));
+                int invalid_pft_count = 0;
+                const auto sum = pft_sum;
+                Kokkos::parallel_reduce(
+                    "MeganKernel_HEMCO3121_AccumulatePft", cells,
+                    KOKKOS_LAMBDA(int i, int j, int& invalid_count) {
+                        const double fraction = pft(i, j, 0);
+                        if (!(fraction >= 0.0 && fraction <= std::numeric_limits<double>::max())) {
+                            ++invalid_count;
+                        } else {
+                            sum(i, j) += fraction;
+                        }
+                    },
+                    invalid_pft_count);
+                if (invalid_pft_count != 0) {
+                    throw std::runtime_error("MeganScheme hemco_3_12_1 PFT fraction '" + MapInput(pft_name) + "' must be finite and nonnegative");
+                }
+            }
+            if (!missing_pfts.empty()) {
+                throw std::runtime_error("MeganScheme hemco_3_12_1 mode missing required PFT field(s) for LAI normalization: " + missing_pfts +
+                                         "; supply them or set hemco_normalize_lai: false");
+            }
+        }
+
+        if (hemco_aef_gridded_) {
+            int invalid_aef_count = 0;
+            Kokkos::parallel_reduce(
+                "MeganKernel_HEMCO3121_ValidateAef", cells,
+                KOKKOS_LAMBDA(int i, int j, int& invalid_count) {
+                    const double value = aef_field(i, j, 0);
+                    if (!(value >= 0.0 && value <= std::numeric_limits<double>::max())) ++invalid_count;
+                },
+                invalid_aef_count);
+            if (invalid_aef_count != 0) {
+                throw std::runtime_error("MeganScheme hemco_3_12_1 gridded AEF must contain only finite nonnegative values");
+            }
+        }
         int invalid_solar_cosine_count = 0;
         Kokkos::parallel_reduce(
             "MeganKernel_HEMCO3121_ValidateSolarCosine", cells,
@@ -266,6 +339,10 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
         const int h_solar_doy = context.day_of_year;
 
         const double h_aef = aef_;
+        const bool h_aef_gridded = hemco_aef_gridded_;
+        const bool h_normalize_lai = hemco_normalize_lai_;
+        const double h_isoprene_scaling = hemco_isoprene_scaling_;
+        const auto h_pft_sum = pft_sum;
         const double h_co2 = hemco_co2_ppm_;
         const bool h_apply_co2 = hemco_co2_inhibition_;
         if (hemco_history_evolving_) {
@@ -289,12 +366,22 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
                 using namespace cece::hemco_megan::v3_12_1;
                 const double T = temp(i, j, 0);
                 const double L = lai(i, j, 0);
-                if (L <= 0.0) {
+                const double aef = h_aef_gridded ? aef_field(i, j, 0) : h_aef;
+                // HEMCO gates on the unnormalized LAI and the AEF.
+                if (L * aef <= 0.0) {
                     emissions_out(i, j, 0) = 0.0;
                     return;
                 }
 
-                const double Lprev = h_evolving ? h_lai_previous_view(i, j, 0) : pmlai(i, j, 0);
+                double Lprev = h_evolving ? h_lai_previous_view(i, j, 0) : pmlai(i, j, 0);
+                double Lcur = L;
+                if (h_normalize_lai) {
+                    const double pft_total = h_pft_sum(i, j);
+                    if (pft_total > 0.0) {
+                        Lcur = std::min(L / pft_total, kLaiMax);
+                        Lprev = std::min(Lprev / pft_total, kLaiMax);
+                    }
+                }
                 double sc = suncos(i, j, 0);
                 if (h_clock_solar) {
                     if (sc <= 0.0) {
@@ -312,7 +399,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
 
                 MeganInputs in;
                 in.T_K = T;
-                in.lai = L;
+                in.lai = Lcur;
                 in.lai_prev = Lprev;
                 in.pardr_Wm2 = qd;
                 in.pardf_Wm2 = qi;
@@ -325,7 +412,7 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
                 in.days_between_lai = h_days_between_lai;
                 in.doy = h_doy;
 
-                emissions_out(i, j, 0) = h_aef * IsopreneEmissionFactor(in);
+                emissions_out(i, j, 0) = h_isoprene_scaling * aef * IsopreneEmissionFactor(in);
             });
         Kokkos::fence();
         if (hemco_history_evolving_) {

@@ -62,7 +62,8 @@ physics_schemes:
     language: cpp
     options:
       megan_method: hemco_3_12_1
-      aef: 1.0e-9
+      aef: 1.0e-9                 # or: hemco_aef_source: gridded, with an aef_isoprene import field
+      hemco_normalize_lai: false  # default true; needs the pft_* import fields
       hemco_co2_inhibition: true
       hemco_co2_ppm: 390.0
       hemco_par_direct_history_wm2: 30.0
@@ -74,7 +75,10 @@ physics_schemes:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `megan_method` | string | `"megan21"` | `"megan21"`, its `"native"` alias, or `"hemco_3_12_1"` |
-| `aef` | double | required | Scalar effective AEF [kg m⁻² s⁻¹] |
+| `aef` | double | required unless `hemco_aef_source: gridded` | Scalar effective AEF [kg m⁻² s⁻¹] (`aef_isop` alias) |
+| `hemco_aef_source` | string | `scalar` if `aef` is set, else required | `scalar` uses `aef`; `gridded` reads the `aef_isoprene` import field [kg m⁻² s⁻¹] (HEMCO `MEGAN_AEF_ISOP`) and rejects a scalar `aef` |
+| `hemco_isoprene_scaling` | double | `1.0` | HEMCO `Isoprene scaling`, a nonnegative multiplier on the isoprene flux (applies to scalar and gridded AEF) |
+| `hemco_normalize_lai` | bool | `true` | HEMCO `Normalize LAI`: divide current and previous LAI by the sum of the 15 vegetated PFT fractions and cap at 6 m² m⁻². Requires the `pft_*` import fields; set `false` when supplying already-normalized LAI |
 | `species_name` | string | `"isoprene"` | This source-conformance path accepts only `"isoprene"` or HEMCO name `"ISOP"` |
 | `hemco_co2_inhibition` | bool | required | Explicitly enable or disable the HEMCO CO₂ inhibition option |
 | `hemco_co2_ppm` | double | required if enabled | CO₂ concentration [ppm] in the finite range 150-1250 (`hemco_3_12_1` only) |
@@ -102,6 +106,13 @@ histories and `hemco_temperature_history_k` instead.
 | `par_diffuse` | W/m² | Diffuse PAR |
 | `solar_cosine` | — | Finite value in [-1, 1]. With `hemco_solar_angle_mode: clock` it is HEMCO's `SUNCOS` day/night gate (nonpositive is night); with `supplied` it is the effective sine of solar elevation |
 | `soil_moisture_root` | fraction | Root-zone soil moisture (optional) |
+| `aef_isoprene` | kg m⁻² s⁻¹ | Gridded isoprene AEF; required with `hemco_aef_source: gridded` (finite, nonnegative) |
+| `pft_ndlf_evgn_tmpt_tree`, `pft_ndlf_evgn_borl_tree`, `pft_ndlf_decd_borl_tree`, `pft_bdlf_evgn_trop_tree`, `pft_bdlf_evgn_tmpt_tree`, `pft_bdlf_decd_trop_tree`, `pft_bdlf_decd_tmpt_tree`, `pft_bdlf_decd_borl_tree`, `pft_bdlf_evgn_shrb`, `pft_bdlf_decd_tmpt_shrb`, `pft_bdlf_decd_borl_shrb`, `pft_c3_arct_grss`, `pft_c3_narc_grss`, `pft_c4_grss`, `pft_crop` | fraction | CLM4 vegetated PFT fractions (HEMCO `CLM4_PFT_*`, excluding bare ground); all 15 are required when `hemco_normalize_lai: true` |
+
+Field names can be remapped with the scheme's `input_mapping`. As in HEMCO, a
+cell is zeroed when the unnormalized `LAI * AEF` is not positive, and a cell
+whose PFT sum is zero keeps its raw LAI. The 12-hour LAI history stores raw
+LAI; normalization is applied to the current and history values each step.
 
 In `clock` mode the scheme needs the clock's day of year and the grid latitude
 and longitude (supplied by the driver). Local hour uses the `local_time`
@@ -114,9 +125,10 @@ horizontal extents and one level. `leaf_area_index_prev` is required only in
 LAI and advances it as a 12-hour running average.
 The scheme fails before launching its kernel if those shapes differ.
 
-For `hemco_3_12_1`, the scalar AEF must already include any upstream PFT/AEF
-processing and isoprene scaling. Supply both LAI fields after any desired PFT
-normalization. AEF and the configured cold-start/fixed histories are spatially
+For `hemco_3_12_1`, a scalar AEF must already include any upstream PFT/AEF
+processing; a gridded AEF is used as given and is then multiplied by
+`hemco_isoprene_scaling`. With `hemco_normalize_lai: false`, supply both LAI
+fields already normalized. With a scalar AEF, the configured cold-start/fixed histories are spatially
 uniform. The default evolving mode stores per-cell state in double precision and updates
 the 5-day temperature/direct-PAR/diffuse-PAR means and 12-hour temperature/LAI
 means after each emission calculation. The 12-hour temperature mean mirrors
@@ -563,7 +575,7 @@ the emission calculation rather than merely matching NetCDF variable names:
 Source-conformance tests do not launch HEMCO. An independently executed,
 controlled reference comparison is a separate validation level; neither
 establishes real-meteorology, restart parity, or complete upstream MEGAN3
-parity. Future work includes gridded PFT/AEF generation, a
+parity. Future work includes multi-compound `CALC_AEF` generation from PFTs, a
 timezone-grid local time for the standard solar angle, multilayer canopy integration, and multi-timestep/coupled
 validation. Validation reports, plots,
 and run-specific inputs/outputs belong with the external experiment evidence.
