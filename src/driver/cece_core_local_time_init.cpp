@@ -1,11 +1,13 @@
 /**
  * @file cece_core_local_time_init.cpp
- * @brief Initialization of the local-time service.
+ * @brief Initialization of the local-time service and per-cell grid coordinates.
  *
  * Mirrors the cece_core_writer_initialize_* precedent: a C-linkage entry point
  * called once from the standalone driver (src/main.cpp) and the NUOPC facade
- * path after grid coordinates exist. It is a no-op when local_time is disabled,
- * so the default (disabled) behavior is byte-identical to a pre-feature run.
+ * path after grid coordinates exist. It always stores band-local latitude and
+ * longitude views on CeceInternalData for physics schemes that need geometry
+ * (e.g. the MEGAN solar angle). The local-time service itself is skipped when
+ * local_time is disabled, so the default behavior is unchanged.
  * When enabled it decodes the RLE UTC-offset grid exactly once, maps it onto
  * the native band grid, and attaches a read-only LocalTimeService to
  * CeceInternalData. Any decode failure returns an error (rc = -1) so the run
@@ -14,6 +16,7 @@
 
 #include <mpi.h>
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,7 +38,7 @@ constexpr const char* kDefaultUtcGridFile = "data/utc_grid_720r.rle";
 extern "C" {
 
 /**
- * @brief Initialize the local-time service on the CECE core data.
+ * @brief Store band-local grid coordinates and, if enabled, the local-time service on the CECE core data.
  *
  * @param data_ptr    Pointer to CeceInternalData.
  * @param nx          Grid dimension in X (== lon_len).
@@ -66,13 +69,13 @@ void cece_core_local_time_init(void* data_ptr, int nx, int ny, int nz, const dou
     }
 
     auto* internal_data = static_cast<cece::CeceInternalData*>(data_ptr);
-
-    // Disabled (default): no file opened, no allocation, service stays null.
-    if (!internal_data->config.local_time.enabled) {
+    if (nx <= 0 || ny <= 0 || lon_len <= 0 || lat_len <= 0) {
+        CECE_LOG_ERROR("cece_core_local_time_init: grid dimensions and coordinate lengths must be positive");
+        *rc = -1;
         return;
     }
 
-    // Resolve the MPI communicator for the band decomposition (writer precedent).
+    // Resolve this rank's band for both the physics coordinate fields and optional timezone offsets.
     MPI_Comm comm = MPI_COMM_WORLD;
     if (cece::mpi_environment_ready()) {
         MPI_Comm temp = MPI_Comm_f2c(static_cast<MPI_Fint>(mpi_comm_f));
@@ -81,6 +84,51 @@ void cece_core_local_time_init(void* data_ptr, int nx, int ny, int nz, const dou
         }
     }
     const cece::BandDecomposition band = cece::BandDecomposition::compute(ny, comm);
+
+    const std::size_t rect_lon_size = static_cast<std::size_t>(nx);
+    const std::size_t rect_lat_size = static_cast<std::size_t>(ny);
+    const std::size_t flat_size = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
+    const bool rectilinear = lon_len == static_cast<int>(rect_lon_size) && lat_len == static_cast<int>(rect_lat_size);
+    const bool flattened = lon_len == static_cast<int>(flat_size) && lat_len == static_cast<int>(flat_size);
+    if (!rectilinear && !flattened) {
+        CECE_LOG_ERROR("cece_core_local_time_init: coordinate lengths do not match rectilinear or flattened grid dimensions");
+        *rc = -1;
+        return;
+    }
+
+    using CoordinateView = Kokkos::View<double**, Kokkos::LayoutLeft, Kokkos::DefaultExecutionSpace>;
+    CoordinateView latitude("cece_grid_latitude", nx, band.ny_local);
+    CoordinateView longitude("cece_grid_longitude", nx, band.ny_local);
+    auto latitude_host = Kokkos::create_mirror_view(latitude);
+    auto longitude_host = Kokkos::create_mirror_view(longitude);
+    for (int j = 0; j < band.ny_local; ++j) {
+        const int global_j = band.j0 + j;
+        for (int i = 0; i < nx; ++i) {
+            const std::size_t flat_index = static_cast<std::size_t>(global_j) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(i);
+            longitude_host(i, j) = lon_coords[flattened ? flat_index : static_cast<std::size_t>(i)];
+            latitude_host(i, j) = lat_coords[flattened ? flat_index : static_cast<std::size_t>(global_j)];
+            if (!std::isfinite(latitude_host(i, j)) || latitude_host(i, j) < -90.0 || latitude_host(i, j) > 90.0 ||
+                !std::isfinite(longitude_host(i, j))) {
+                CECE_LOG_ERROR("cece_core_local_time_init: grid coordinates must be finite and latitude must be in [-90, 90]");
+                *rc = -1;
+                return;
+            }
+        }
+    }
+    Kokkos::deep_copy(latitude, latitude_host);
+    Kokkos::deep_copy(longitude, longitude_host);
+    internal_data->grid_latitude_degrees = latitude;
+    internal_data->grid_longitude_degrees = longitude;
+
+    // No timezone offsets are needed unless local_time is explicitly enabled.
+    if (!internal_data->config.local_time.enabled) return;
+
+    // LocalTimeService currently consumes rectilinear longitude and latitude axes.
+    if (!rectilinear) {
+        CECE_LOG_ERROR("cece_core_local_time_init: local_time.enabled currently requires rectilinear coordinate axes");
+        *rc = -1;
+        return;
+    }
 
     std::vector<double> lon_vec(lon_coords, lon_coords + lon_len);
     std::vector<double> lat_vec(lat_coords, lat_coords + lat_len);

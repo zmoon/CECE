@@ -57,6 +57,8 @@ void RunPhysicsSchemeByName(cece::CeceInternalData& d, const std::string& scheme
                 context.utc_epoch_seconds = step.utc_epoch_seconds;
                 context.day_of_year = step.day_of_year;
                 context.local_time = d.local_time.get();
+                context.latitude_degrees = d.grid_latitude_degrees;
+                context.longitude_degrees = d.grid_longitude_degrees;
                 // The scheme's own cadence is the time it represents (HEMCO's TS_EMIS), including on the
                 // first-step guaranteed run.
                 context.dt_seconds = interval_seconds;
@@ -129,6 +131,8 @@ void ExecuteStepUnconditional(cece::CeceInternalData& d, int hour, int day_of_we
     cece::SchemeRunContext context;
     context.dt_seconds = d.config.driver_config.timestep_seconds;
     context.local_time = d.local_time.get();
+    context.latitude_degrees = d.grid_latitude_degrees;
+    context.longitude_degrees = d.grid_longitude_degrees;
     for (auto& scheme : d.active_schemes) {
         if (scheme) {
             scheme->Run(d.import_state, d.export_state, context);

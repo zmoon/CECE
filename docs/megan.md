@@ -82,6 +82,7 @@ physics_schemes:
 | `hemco_par_direct_history_wm2` | double | `30.0` | Initial direct PAR history [W m⁻²] in evolving mode, fixed direct history otherwise |
 | `hemco_par_diffuse_history_wm2` | double | `48.0` | Initial diffuse PAR history [W m⁻²] in evolving mode, fixed diffuse history otherwise |
 | `hemco_temperature_history_k` | double | `288.15` | Initial/fixed historical temperature [K] |
+| `hemco_solar_angle_mode` | string | `clock` | `clock` computes HEMCO's `SOLAR_ANGLE` PAR-response sine from the clock's UTC day of year, local hour and grid latitude; `solar_cosine` then only gates day/night (`> 0`). `supplied` uses `solar_cosine` directly as the sine. |
 | `hemco_day_of_year` | integer | required in fixed mode | Fixed-history day of year. Ignored (with a warning) in evolving mode, where the CECE clock supplies it |
 
 `co2_concentration` remains a compatibility alias for `hemco_co2_ppm`, and
@@ -99,8 +100,13 @@ histories and `hemco_temperature_history_k` instead.
 | `leaf_area_index_prev` | m²/m² | Required exact effective previous-day `PMISOLAI` only in fixed-history mode; evolving mode initializes it from current LAI |
 | `par_direct` | W/m² | Direct PAR |
 | `par_diffuse` | W/m² | Diffuse PAR |
-| `solar_cosine` | — | Finite effective sine of solar elevation (cosine of zenith) in [-1, 1]; nonpositive values represent night |
+| `solar_cosine` | — | Finite value in [-1, 1]. With `hemco_solar_angle_mode: clock` it is HEMCO's `SUNCOS` day/night gate (nonpositive is night); with `supplied` it is the effective sine of solar elevation |
 | `soil_moisture_root` | fraction | Root-zone soil moisture (optional) |
+
+In `clock` mode the scheme needs the clock's day of year and the grid latitude
+and longitude (supplied by the driver). Local hour uses the `local_time`
+service offsets when it is enabled, and otherwise HEMCO's 15-degree longitude
+bins. The scheme throws if the coordinates or day of year are missing.
 
 All required source-conformance fields and the output must have the same
 horizontal extents and one level. `leaf_area_index_prev` is required only in
@@ -541,10 +547,12 @@ the emission calculation rather than merely matching NetCDF variable names:
 4. Match both solar calculations: HEMCO's `ExtState%SUNCOS` gates day/night,
    while MEGAN `SOLAR_ANGLE` supplies the PAR-response sine using local time
    from `HcoClock_GetLocal`. Without a TIMEZONES file, that clock uses
-   15-degree longitude bins. Supply the PAR sine as CECE's `solar_cosine`
-   where the outer gate is positive and a nonpositive value elsewhere.
-   Preserve both upstream fields and local-time settings for each reference
-   case; `HCO_SUNCOS` alone is not the PAR-response sine.
+   15-degree longitude bins. CECE's default `hemco_solar_angle_mode: clock`
+   reproduces this: supply HEMCO's `SUNCOS` as `solar_cosine` and CECE derives
+   the PAR sine itself. For reference comparisons that start from an
+   externally computed PAR sine, use `supplied`. Preserve both upstream fields
+   and local-time settings for each reference case; `HCO_SUNCOS` alone is not
+   the PAR-response sine.
 5. Compare ordered coordinates, masks, mass units, and single-/multi-rank
    output before interpreting flux differences. HEMCO mean diagnostics use
    `REAL(sp)` storage and accumulation. For a single 3600-second interval,
@@ -555,8 +563,8 @@ the emission calculation rather than merely matching NetCDF variable names:
 Source-conformance tests do not launch HEMCO. An independently executed,
 controlled reference comparison is a separate validation level; neither
 establishes real-meteorology, restart parity, or complete upstream MEGAN3
-parity. Future work includes gridded PFT/AEF generation, clock-driven solar
-calculations, multilayer canopy integration, and multi-timestep/coupled
+parity. Future work includes gridded PFT/AEF generation, a
+timezone-grid local time for the standard solar angle, multilayer canopy integration, and multi-timestep/coupled
 validation. Validation reports, plots,
 and run-specific inputs/outputs belong with the external experiment evidence.
 

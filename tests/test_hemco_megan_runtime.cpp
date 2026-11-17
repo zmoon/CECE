@@ -235,6 +235,14 @@ class HEMCO3121MeganRuntime : public ::testing::Test {
         return field;
     }
 
+    static SchemeGridCoordinateView MakeCoordinate(double value) {
+        Kokkos::View<double**, Kokkos::LayoutLeft, Kokkos::DefaultExecutionSpace> coordinate("runtime_coordinate", 1, 1);
+        auto host = Kokkos::create_mirror_view(coordinate);
+        host(0, 0) = value;
+        Kokkos::deep_copy(coordinate, host);
+        return coordinate;
+    }
+
     static OneCellStates MakeStates(const CellInputs& input, bool include_previous_lai = true) {
         OneCellStates states;
         states.import_state.fields["temperature"] = MakeField("runtime_temperature", input.temperature_k);
@@ -252,6 +260,7 @@ class HEMCO3121MeganRuntime : public ::testing::Test {
     static std::string RuntimeConfig(bool apply_co2_inhibition = true) {
         return std::string("megan_method: hemco_3_12_1\n") +
                "history_mode: fixed\n"
+               "hemco_solar_angle_mode: supplied\n"
                "aef: 2.5e-9\n"
                "export_field_name: runtime_isoprene\n"
                "hemco_co2_ppm: 415.0\n"
@@ -658,6 +667,7 @@ TEST_F(HEMCO3121MeganRuntime, QuotedConvertibleScalarsPreserveConfiguredValues) 
     const std::string yaml =
         "megan_method: 'hemco_3_12_1'\n"
         "history_mode: 'fixed'\n"
+        "hemco_solar_angle_mode: 'supplied'\n"
         "aef: '2.5e-9'\n"
         "export_field_name: 'runtime_isoprene'\n"
         "hemco_co2_ppm: '415.0'\n"
@@ -677,7 +687,8 @@ TEST_F(HEMCO3121MeganRuntime, QuotedConvertibleScalarsPreserveConfiguredValues) 
 
 TEST_F(HEMCO3121MeganRuntime, AbsentOptionalSettingsRetainColdStartDefaults) {
     // Evolving is the default, so no explicit history or day-of-year settings are needed.
-    auto config = conf::Config::from_string("megan_method: hemco_3_12_1\naef: 2.5e-9\nhemco_co2_inhibition: false\n");
+    auto config =
+        conf::Config::from_string("megan_method: hemco_3_12_1\nhemco_solar_angle_mode: supplied\naef: 2.5e-9\nhemco_co2_inhibition: false\n");
     const CellInputs input;
     auto states = MakeStates(input, false);
     auto& output = states.export_state.fields["isoprene_emissions"];
@@ -798,6 +809,99 @@ TEST_F(HEMCO3121MeganRuntime, InvalidSolarCosineFailsClosed) {
         scheme.Initialize(config.root(), nullptr);
         EXPECT_THROW(scheme.Run(states.import_state, states.export_state), std::runtime_error);
     }
+}
+
+TEST(HEMCO3121MeganSolarAngle, MatchesHemcoFormula) {
+    // Independent evaluation of HEMCO's SOLAR_ANGLE for 20 June, latitude 40 N.
+    const double lat = 40.0 * std::numbers::pi / 180.0;
+    const double sin_delta = -std::sin(0.40907) * std::cos(6.28 * (171.0 + 10.0) / 365.0);
+    const double cos_delta = std::sqrt(1.0 - sin_delta * sin_delta);
+    for (const double hour : {0.0, 6.0, 12.0, 15.5, 23.0}) {
+        const double expected = std::sin(lat) * sin_delta + std::cos(lat) * cos_delta * std::cos(2.0 * std::numbers::pi * (hour - 12.0) / 24.0);
+        EXPECT_NEAR(SolarAngle(171, hour, 40.0), expected, 1.0e-12) << "hour " << hour;
+    }
+    EXPECT_GT(SolarAngle(171, 12.0, 40.0), 0.9) << "near-solstice noon sun is high";
+    EXPECT_LT(SolarAngle(171, 0.0, 40.0), 0.0) << "local midnight is below the horizon";
+}
+
+TEST(HEMCO3121MeganSolarAngle, LongitudeZoneOffsetRoundsToNearestFifteenDegrees) {
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(0.0), 0);
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(-90.0), -6 * 3600);
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(-97.4), -6 * 3600);
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(-98.0), -7 * 3600);
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(7.4), 0);
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(7.6), 3600);
+    EXPECT_EQ(LongitudeTimeZoneOffsetSeconds(179.0), 12 * 3600);
+}
+
+TEST_F(HEMCO3121MeganRuntime, ClockSolarAngleUsesLocalHourFromLongitudeZone) {
+    const CellInputs input;
+    auto states = MakeStates(input);
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "hemco_solar_angle_mode: supplied", "hemco_solar_angle_mode: clock"));
+
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.day_of_year = 171;
+    context.utc_epoch_seconds = 1687284000;  // 2023-06-20 18:00 UTC, i.e. 12:00 local at 90 W
+    context.latitude_degrees = MakeCoordinate(40.0);
+    context.longitude_degrees = MakeCoordinate(-90.0);
+    scheme.Run(states.import_state, states.export_state, context);
+
+    // Fixed-history mode keeps the configured day of year for the other gammas; only the solar angle follows the clock.
+    MeganInputs expected = ScalarInputs(input);
+    expected.suncos = SolarAngle(171, 12.0, 40.0);
+    ExpectScalarMatch(ReadOutput(states), kRuntimeAef * IsopreneEmissionFactor(expected));
+    const double noon_value = ReadOutput(states);
+
+    context.utc_epoch_seconds += 6 * 3600;  // 18:00 local
+    scheme.Run(states.import_state, states.export_state, context);
+    expected.suncos = SolarAngle(171, 18.0, 40.0);
+    ExpectScalarMatch(ReadOutput(states), kRuntimeAef * IsopreneEmissionFactor(expected));
+    EXPECT_NE(ReadOutput(states), noon_value);
+}
+
+TEST_F(HEMCO3121MeganRuntime, ClockSolarAngleKeepsSuppliedCosineAsDayNightGate) {
+    CellInputs input;
+    input.solar_cosine = -0.1;
+    auto states = MakeStates(input);
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "hemco_solar_angle_mode: supplied", "hemco_solar_angle_mode: clock"));
+
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.day_of_year = 171;
+    context.utc_epoch_seconds = 1687284000;  // local noon: the clock alone would say the sun is up
+    context.latitude_degrees = MakeCoordinate(40.0);
+    context.longitude_degrees = MakeCoordinate(-90.0);
+    scheme.Run(states.import_state, states.export_state, context);
+
+    MeganInputs expected = ScalarInputs(input);
+    expected.suncos = 0.0;
+    ExpectScalarMatch(ReadOutput(states), kRuntimeAef * IsopreneEmissionFactor(expected));
+}
+
+TEST_F(HEMCO3121MeganRuntime, ClockSolarAngleRequiresClockAndGridCoordinates) {
+    auto config = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "hemco_solar_angle_mode: supplied", "hemco_solar_angle_mode: clock"));
+    MeganScheme scheme;
+    scheme.Initialize(config.root(), nullptr);
+    auto states = MakeStates(CellInputs{});
+
+    SchemeRunContext context;
+    context.dt_seconds = 3600;
+    context.day_of_year = 171;
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state, context), std::runtime_error) << "missing coordinates";
+
+    context.latitude_degrees = MakeCoordinate(40.0);
+    context.longitude_degrees = MakeCoordinate(-90.0);
+    context.day_of_year = 0;
+    EXPECT_THROW(scheme.Run(states.import_state, states.export_state, context), std::runtime_error) << "missing day of year";
+
+    auto bad_mode = conf::Config::from_string(ReplaceSetting(RuntimeConfig(), "hemco_solar_angle_mode: supplied", "hemco_solar_angle_mode: bogus"));
+    MeganScheme bad_scheme;
+    EXPECT_THROW(bad_scheme.Initialize(bad_mode.root(), nullptr), std::invalid_argument);
 }
 
 TEST_F(HEMCO3121MeganRuntime, Megan21SelectorsRetainMissingFieldNoOp) {

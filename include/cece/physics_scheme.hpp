@@ -6,6 +6,7 @@
  * @brief Defines the base classes for physics schemes in CECE.
  */
 
+#include <Kokkos_Core.hpp>
 #include <conf/value.hpp>
 #include <cstdint>
 #include <initializer_list>
@@ -23,15 +24,19 @@ namespace cece {
 
 class LocalTimeService;
 
+using SchemeGridCoordinateView = Kokkos::View<const double**, Kokkos::LayoutLeft, Kokkos::DefaultExecutionSpace>;
+
 /**
- * @brief Clock information for one scheduled physics-scheme invocation.
+ * @brief Clock and grid-coordinate inputs for one scheduled physics invocation.
  */
 struct SchemeRunContext {
-    int dt_seconds = 0;                  ///< Seconds since this scheme's previous invocation.
+    int dt_seconds = 0;                  ///< Seconds represented by this scheme invocation.
     int elapsed_seconds = 0;             ///< Seconds since the configured simulation start.
     int day_of_year = 0;                 ///< UTC day of year, 1-366.
     std::int64_t utc_epoch_seconds = 0;  ///< Current UTC instant in Unix seconds.
     const LocalTimeService* local_time = nullptr;
+    SchemeGridCoordinateView latitude_degrees;
+    SchemeGridCoordinateView longitude_degrees;
 };
 
 /**

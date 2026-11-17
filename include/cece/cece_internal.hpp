@@ -41,6 +41,8 @@ struct CeceInternalData {
     /// Local-time service. Null when local_time is disabled —
     /// temporal scaling then takes the exact pre-feature UTC scalar path.
     std::unique_ptr<LocalTimeService> local_time;
+    Kokkos::View<double**, Kokkos::LayoutLeft, Kokkos::DefaultExecutionSpace> grid_latitude_degrees;
+    Kokkos::View<double**, Kokkos::LayoutLeft, Kokkos::DefaultExecutionSpace> grid_longitude_degrees;
 
     // Cached metadata
     int nx = 0, ny = 0, nz = 0;                     ///< Cached grid dimensions (ny is the GLOBAL latitude count).

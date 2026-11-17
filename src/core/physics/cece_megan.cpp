@@ -28,6 +28,7 @@
 #include <numbers>
 #include <stdexcept>
 
+#include "cece/cece_local_time.hpp"
 #include "cece/cece_logger.hpp"
 #include "cece/cece_physics_factory.hpp"
 
@@ -65,6 +66,10 @@ void MeganScheme::Initialize(const conf::Value& config, CeceDiagnosticManager* d
             throw std::invalid_argument("MeganScheme: history_mode must be 'evolving' or 'fixed'");
         }
         hemco_history_evolving_ = history_mode == "evolving";
+        hemco_solar_angle_mode_ = config["hemco_solar_angle_mode"].string_or("clock");
+        if (hemco_solar_angle_mode_ != "clock" && hemco_solar_angle_mode_ != "supplied") {
+            throw std::invalid_argument("MeganScheme: hemco_solar_angle_mode must be 'clock' or 'supplied'");
+        }
         if (!config["aef"].is_defined() && !config["aef_isop"].is_defined()) {
             throw std::invalid_argument("MeganScheme: hemco_3_12_1 mode requires an explicit effective 'aef'");
         }
@@ -235,6 +240,31 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
             throw std::runtime_error("MeganScheme hemco_3_12_1 solar_cosine must contain only finite values in [-1, 1]");
         }
 
+        // HEMCO computes the PAR-response solar elevation from day of year, local hour and latitude;
+        // solar_cosine then only gates day/night (SUNCOS > 0). "supplied" uses solar_cosine directly.
+        const bool h_clock_solar = hemco_solar_angle_mode_ == "clock";
+        const auto latitude = context.latitude_degrees;
+        const auto longitude = context.longitude_degrees;
+        LocalTimeService::OffsetView local_offsets;
+        bool h_use_local_offsets = false;
+        if (h_clock_solar) {
+            if (context.day_of_year < 1 || context.day_of_year > 366) {
+                throw std::runtime_error("MeganScheme hemco_3_12_1 hemco_solar_angle_mode 'clock' requires a clock day_of_year in [1, 366]");
+            }
+            if (latitude.data() == nullptr || longitude.data() == nullptr || latitude.extent(0) != nx || latitude.extent(1) != ny ||
+                longitude.extent(0) != nx || longitude.extent(1) != ny) {
+                throw std::runtime_error(
+                    "MeganScheme hemco_3_12_1 hemco_solar_angle_mode 'clock' requires grid latitude/longitude matching the field shape; "
+                    "use hemco_solar_angle_mode: supplied to take solar_cosine as given");
+            }
+            if (context.local_time != nullptr && !context.local_time->UtcFallback()) {
+                local_offsets = context.local_time->Offsets();
+                h_use_local_offsets = local_offsets.extent(0) == nx && local_offsets.extent(1) == ny;
+            }
+        }
+        const std::int64_t h_utc_epoch = context.utc_epoch_seconds;
+        const int h_solar_doy = context.day_of_year;
+
         const double h_aef = aef_;
         const double h_co2 = hemco_co2_ppm_;
         const bool h_apply_co2 = hemco_co2_inhibition_;
@@ -265,7 +295,18 @@ void MeganScheme::Run(CeceImportState& import_state, CeceExportState& export_sta
                 }
 
                 const double Lprev = h_evolving ? h_lai_previous_view(i, j, 0) : pmlai(i, j, 0);
-                const double sc = suncos(i, j, 0);
+                double sc = suncos(i, j, 0);
+                if (h_clock_solar) {
+                    if (sc <= 0.0) {
+                        sc = 0.0;
+                    } else {
+                        const std::int64_t offset =
+                            h_use_local_offsets ? static_cast<std::int64_t>(local_offsets(i, j)) : LongitudeTimeZoneOffsetSeconds(longitude(i, j));
+                        std::int64_t local_seconds = (h_utc_epoch + offset) % 86400;
+                        if (local_seconds < 0) local_seconds += 86400;
+                        sc = SolarAngle(h_solar_doy, static_cast<double>(local_seconds) / 3600.0, latitude(i, j));
+                    }
+                }
                 const double qd = pardr(i, j, 0);
                 const double qi = pardf(i, j, 0);
 

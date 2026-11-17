@@ -45,8 +45,12 @@
  * inhibition at 390 ppm; those two choices are explicit inputs, not universal
  * HEMCO constants.
  * This implementation does not reproduce:
- *   - HEMCO's latitude/local-time solar-angle calculation; `suncos` must be
- *     the effective sine of solar elevation (equivalently cosine of zenith).
+ *   - HEMCO's timezone-grid local time unless CECE's local-time service is
+ *     enabled; otherwise local time uses 15-degree longitude bins, as HEMCO
+ *     does without a TIMEZONES file. With `hemco_solar_angle_mode: clock`
+ *     (default) `suncos` is only the day/night gate and the PAR-response sine
+ *     comes from day of year, local hour and latitude; `supplied` uses
+ *     `suncos` directly.
  *   - Gridded PFT/AEF and normalized-LAI preprocessing. Callers supply an
  *     effective AEF (including ISOP_SCALING where applicable) and separately
  *     supply current/previous LAI after any requested HEMCO normalization.
@@ -239,6 +243,34 @@ KOKKOS_INLINE_FUNCTION double GammaPAR(double pardr_Wm2, double pardf_Wm2, doubl
     const double beta_degrees = std::asin(sin_beta) * 180.0 / std::numbers::pi;
     if (beta_degrees < 1.0 && gamma_par > 0.1) gamma_par = 0.0;
     return std::max(gamma_par, 0.0);
+}
+
+/**
+ * @brief HEMCO's solar elevation sine from day of year, local solar time, and latitude.
+ * @param doy Day of year (1-366).
+ * @param local_hour Fractional local solar hour [0, 24).
+ * @param latitude_degrees Geographic latitude in degrees.
+ */
+KOKKOS_INLINE_FUNCTION double SolarAngle(int doy, double local_hour, double latitude_degrees) noexcept {
+    constexpr double pi = 3.14159265358979323846;
+    const double latitude_radians = latitude_degrees * pi / 180.0;
+    const double sin_declination = -std::sin(0.40907) * std::cos(6.28 * (static_cast<double>(doy) + 10.0) / 365.0);
+    const double cos_declination = std::sqrt(std::max(0.0, 1.0 - sin_declination * sin_declination));
+    const double a = std::sin(latitude_radians) * sin_declination;
+    const double b = std::cos(latitude_radians) * cos_declination;
+    const double sin_elevation = a + b * std::cos(2.0 * pi * (local_hour - 12.0) / 24.0);
+    return std::clamp(sin_elevation, -1.0, 1.0);
+}
+
+/**
+ * @brief HEMCO's approximate local-time zone offset when no timezone grid is supplied.
+ * @param longitude_degrees Geographic longitude in degrees.
+ * @return Whole-hour UTC offset in seconds, rounded to the nearest 15-degree zone.
+ */
+KOKKOS_INLINE_FUNCTION int LongitudeTimeZoneOffsetSeconds(double longitude_degrees) noexcept {
+    const double zone = longitude_degrees / 15.0;
+    const int hours = zone >= 0.0 ? static_cast<int>(std::floor(zone + 0.5)) : static_cast<int>(std::ceil(zone - 0.5));
+    return hours * 3600;
 }
 
 /**
@@ -521,6 +553,7 @@ class MeganScheme : public BasePhysicsScheme {
     double hemco_co2_ppm_ = 390.0;  ///< selected reference-case CO₂ [ppm]
     bool hemco_co2_inhibition_ = true;
     bool hemco_history_evolving_ = true;
+    std::string hemco_solar_angle_mode_ = "clock";
     double hemco_par_direct_history_wm2_ = hemco_megan::v3_12_1::kParDirectHistoryWm2;
     double hemco_par_diffuse_history_wm2_ = hemco_megan::v3_12_1::kParDiffuseHistoryWm2;
     double hemco_temperature_history_k_ = hemco_megan::v3_12_1::kTemperatureHistoryK;
